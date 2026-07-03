@@ -16,7 +16,7 @@ default = ["synapse-core/ort-download"]
 ort-dynamic = ["synapse-core/ort-dynamic"]
 
 [dependencies]
-synapse-core = { workspace = true, default-features = false }
+synapse-core = { path = "../synapse-core", version = "0.1.0", default-features = false }
 uniffi = { version = "0.32", features = ["cli"] }
 thiserror = { workspace = true }
 

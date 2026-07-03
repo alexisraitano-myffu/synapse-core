@@ -17,3 +17,10 @@ ort-dynamic = ["fastembed/ort-load-dynamic"]
 fastembed = { workspace = true }
 thiserror = { workspace = true }
 serde_json = "1"
+
+[dev-dependencies]
+# Same ort that fastembed uses; only for the ort_probe bisect example.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std"] }
+libloading = "0.9"
+backtrace = "0.3"
+libc = "0.2"

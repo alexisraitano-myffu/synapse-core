@@ -76,7 +76,13 @@ impl Embedder {
         let model_def =
             UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files).with_pooling(Pooling::Mean);
 
-        let options = InitOptionsUserDefined::default().with_max_length(max_length);
+        // Single intra-op thread: onnxruntime's default pool sizing relies on
+        // cpuinfo, which fails on emulated/unknown CPUs (hangs observed on the
+        // Android emulator), and one thread is the sane default for embedding
+        // one short text at a time on mobile anyway.
+        let options = InitOptionsUserDefined::default()
+            .with_max_length(max_length)
+            .with_intra_threads(1);
 
         let model = TextEmbedding::try_new_from_user_defined(model_def, options)
             .map_err(|e| CoreError::ModelLoad(e.to_string()))?;
