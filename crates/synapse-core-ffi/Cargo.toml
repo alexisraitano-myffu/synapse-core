@@ -1,0 +1,25 @@
+[package]
+name = "synapse-core-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UniFFI binding of synapse-core for the Synapse mobile apps (Kotlin/Swift)."
+
+[lib]
+name = "synapse_core_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[features]
+default = ["synapse-core/ort-download"]
+# Android/iOS builds: the app ships libonnxruntime and ort loads it at runtime.
+ort-dynamic = ["synapse-core/ort-dynamic"]
+
+[dependencies]
+synapse-core = { workspace = true, default-features = false }
+uniffi = { version = "0.32", features = ["cli"] }
+thiserror = { workspace = true }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

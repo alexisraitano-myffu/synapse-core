@@ -1,0 +1,11 @@
+/target
+**/*.so
+**/*.dylib
+**/*.a
+.venv/
+__pycache__/
+*.whl
+# Model files are runtime data, never committed.
+models/
+.DS_Store
+bindings/

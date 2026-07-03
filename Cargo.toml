@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/synapse-core",
+    "crates/synapse-core-py",
+    "crates/synapse-core-ffi",
+]
+# synapse-core-py links against libpython symbols resolved at import time and
+# must be built through maturin (which passes -undefined dynamic_lookup).
+default-members = [
+    "crates/synapse-core",
+    "crates/synapse-core-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/alexisraitano/synapse-core"
+
+[workspace.dependencies]
+synapse-core = { path = "crates/synapse-core" }
+fastembed = { version = "5.17", default-features = false }
+thiserror = "2"
+
+[profile.release]
+lto = true
+strip = true
