@@ -35,13 +35,19 @@ fn main() {
     let mut all_new_facts = Vec::new();
     let entries = corpus["entries"].as_array().expect("entries");
     for item in entries {
-        let capture_id = item["capture_id"].as_i64().expect("capture_id");
+        // Corpus ids are historical integers; the uuid-pk schema stores
+        // them as their text form (same convention as the Python replay).
+        let capture_id = match &item["capture_id"] {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            other => panic!("capture_id: {other:?}"),
+        };
         let content = item["content"].as_str().unwrap_or("");
         sql.execute(
             "INSERT INTO inbox (id, content, source, created_at, status) \
              VALUES (?, ?, ?, ?, 'queued')",
             &[
-                SqlValue::Integer(capture_id),
+                SqlValue::Text(capture_id.clone()),
                 SqlValue::Text(content.to_string()),
                 SqlValue::Text("golden".to_string()),
                 SqlValue::Text(item["created_at"].as_str().unwrap_or("").to_string()),

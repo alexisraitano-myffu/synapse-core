@@ -98,12 +98,12 @@ impl Storage {
         Ok(Self { inner })
     }
 
-    fn upsert_note_vector(&self, py: Python<'_>, note_id: i64, embedding: &[u8]) -> PyResult<()> {
+    fn upsert_note_vector(&self, py: Python<'_>, note_id: &str, embedding: &[u8]) -> PyResult<()> {
         py.detach(|| self.inner.upsert_note_vector(note_id, embedding))
             .map_err(core_err)
     }
 
-    fn delete_note_vector(&self, py: Python<'_>, note_id: i64) -> PyResult<()> {
+    fn delete_note_vector(&self, py: Python<'_>, note_id: &str) -> PyResult<()> {
         py.detach(|| self.inner.delete_note_vector(note_id))
             .map_err(core_err)
     }
@@ -111,7 +111,7 @@ impl Storage {
     fn get_note_vector<'py>(
         &self,
         py: Python<'py>,
-        note_id: i64,
+        note_id: &str,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let vec = py
             .detach(|| self.inner.get_note_vector(note_id))
@@ -120,7 +120,7 @@ impl Storage {
     }
 
     /// KNN over episodic notes → [(note_id, l2_distance)], distance-ascending.
-    fn search_notes(&self, py: Python<'_>, query: &[u8], k: u32) -> PyResult<Vec<(i64, f64)>> {
+    fn search_notes(&self, py: Python<'_>, query: &[u8], k: u32) -> PyResult<Vec<(String, f64)>> {
         let hits = py
             .detach(|| self.inner.search_notes(query, k))
             .map_err(core_err)?;
@@ -403,7 +403,7 @@ impl Brain {
         confidence: f64,
         source_inbox_id_json: &str,
         persistence_value: i64,
-        provenance_capture_id: Option<i64>,
+        provenance_capture_id: Option<String>,
         category_json: &str,
     ) -> PyResult<String> {
         let value: serde_json::Value = serde_json::from_str(value_json)

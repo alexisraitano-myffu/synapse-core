@@ -5,7 +5,7 @@
 //! Parity contract with the Python implementation it replaces
 //! (`entity_search.py` + the inline vec0 SQL):
 //! - on-disk format unchanged: L2-normalized little-endian float32 blobs, in
-//!   the `atomic_notes_vec` vec0 table (rowid = note id) and in the
+//!   the `atomic_notes_vec` vec0 table (note_id = note uuid, SYN-112) and in the
 //!   `entities.embedding` / `resources.embedding` BLOB columns;
 //! - notes: native sqlite-vec KNN (`MATCH ? AND k = ?`, L2 distance);
 //! - entities/resources (UUID string PKs, no int rowid for vec0): exact linear
@@ -27,7 +27,7 @@ const EMBEDDING_BYTES: usize = EMBEDDING_DIM * 4;
 /// A note KNN hit; `distance` is sqlite-vec's L2 on unit vectors ([0, 2]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NoteHit {
-    pub note_id: i64,
+    pub note_id: String,
     pub distance: f64,
 }
 
@@ -97,6 +97,8 @@ impl Storage {
         // Same rationale as sql.rs: apsw-era behavior is foreign_keys OFF.
         conn.pragma_update(None, "foreign_keys", false)?;
         schema::init_schema(&conn)?;
+        // SYN-112: legacy integer ids → uuid TEXT pks (no-op once done).
+        crate::migrate::migrate_integer_ids(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -110,26 +112,27 @@ impl Storage {
 
     // ── Notes (vec0) ─────────────────────────────────────────────────────
 
-    pub fn upsert_note_vector(&self, note_id: i64, embedding: &[u8]) -> Result<(), CoreError> {
+    pub fn upsert_note_vector(&self, note_id: &str, embedding: &[u8]) -> Result<(), CoreError> {
         check_dim(embedding)?;
         self.lock()?.execute(
-            "INSERT OR REPLACE INTO atomic_notes_vec(rowid, embedding) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO atomic_notes_vec(note_id, embedding) VALUES (?1, ?2)",
             params![note_id, embedding],
         )?;
         Ok(())
     }
 
-    pub fn delete_note_vector(&self, note_id: i64) -> Result<(), CoreError> {
+    pub fn delete_note_vector(&self, note_id: &str) -> Result<(), CoreError> {
         self.lock()?.execute(
-            "DELETE FROM atomic_notes_vec WHERE rowid = ?1",
+            "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
             params![note_id],
         )?;
         Ok(())
     }
 
-    pub fn get_note_vector(&self, note_id: i64) -> Result<Option<Vec<u8>>, CoreError> {
+    pub fn get_note_vector(&self, note_id: &str) -> Result<Option<Vec<u8>>, CoreError> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT embedding FROM atomic_notes_vec WHERE rowid = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT embedding FROM atomic_notes_vec WHERE note_id = ?1")?;
         let mut rows = stmt.query(params![note_id])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -142,7 +145,7 @@ impl Storage {
         check_dim(query)?;
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT rowid, distance FROM atomic_notes_vec \
+            "SELECT note_id, distance FROM atomic_notes_vec \
              WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance",
         )?;
         let hits = stmt
@@ -389,24 +392,24 @@ mod tests {
         let a = unit_vec(0.0);
         let b = unit_vec(0.3);
         let far = unit_vec(2.0);
-        storage.upsert_note_vector(1, &a).unwrap();
-        storage.upsert_note_vector(2, &b).unwrap();
-        storage.upsert_note_vector(3, &far).unwrap();
+        storage.upsert_note_vector("note-a", &a).unwrap();
+        storage.upsert_note_vector("note-b", &b).unwrap();
+        storage.upsert_note_vector("note-far", &far).unwrap();
 
-        assert_eq!(storage.get_note_vector(1).unwrap().unwrap(), a);
-        assert!(storage.get_note_vector(99).unwrap().is_none());
+        assert_eq!(storage.get_note_vector("note-a").unwrap().unwrap(), a);
+        assert!(storage.get_note_vector("absent").unwrap().is_none());
 
         let hits = storage.search_notes(&a, 3).unwrap();
         assert_eq!(
-            hits.iter().map(|h| h.note_id).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            hits.iter().map(|h| h.note_id.as_str()).collect::<Vec<_>>(),
+            vec!["note-a", "note-b", "note-far"]
         );
         assert!(hits[0].distance < 1e-6);
         // L2 between unit vectors at angle θ = 2·sin(θ/2).
         assert!((hits[1].distance - 2.0 * (0.3f64 / 2.0).sin()).abs() < 1e-6);
 
-        storage.delete_note_vector(1).unwrap();
-        assert!(storage.get_note_vector(1).unwrap().is_none());
+        storage.delete_note_vector("note-a").unwrap();
+        assert!(storage.get_note_vector("note-a").unwrap().is_none());
         assert_eq!(storage.search_notes(&a, 3).unwrap().len(), 2);
     }
 
@@ -501,7 +504,7 @@ mod tests {
     #[test]
     fn rejects_wrong_dimension_writes() {
         let (_dir, storage) = open_temp();
-        assert!(storage.upsert_note_vector(1, &[0u8; 8]).is_err());
+        assert!(storage.upsert_note_vector("n1", &[0u8; 8]).is_err());
         assert!(storage.set_entity_embedding("x", &[0u8; 8]).is_err());
         assert!(storage.search_notes(&[0u8; 8], 3).is_err());
     }

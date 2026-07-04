@@ -214,24 +214,26 @@ mod tests {
 
         c.execute("BEGIN", &[]).unwrap();
         c.execute(
-            "INSERT INTO atomic_notes (content) VALUES (?1)",
-            &[SqlValue::Text("pensée".into())],
+            "INSERT INTO atomic_notes (id, content) VALUES (?1, ?2)",
+            &[
+                SqlValue::Text("note-uuid-1".into()),
+                SqlValue::Text("pensée".into()),
+            ],
         )
         .unwrap();
-        let note_id = c.last_insert_rowid().unwrap();
         c.execute("COMMIT", &[]).unwrap();
 
         // Core vector write after commit, then read back through raw SQL.
         let blob: Vec<u8> = (0..384u32)
             .flat_map(|i| (if i == 0 { 1.0f32 } else { 0.0 }).to_le_bytes())
             .collect();
-        storage.upsert_note_vector(note_id, &blob).unwrap();
+        storage.upsert_note_vector("note-uuid-1", &blob).unwrap();
         let r = c
             .execute(
-                "SELECT rowid FROM atomic_notes_vec WHERE embedding MATCH ?1 AND k = 1",
+                "SELECT note_id FROM atomic_notes_vec WHERE embedding MATCH ?1 AND k = 1",
                 &[SqlValue::Blob(blob)],
             )
             .unwrap();
-        assert_eq!(r.rows, vec![vec![SqlValue::Integer(note_id)]]);
+        assert_eq!(r.rows, vec![vec![SqlValue::Text("note-uuid-1".into())]]);
     }
 }

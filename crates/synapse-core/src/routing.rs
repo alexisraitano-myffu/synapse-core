@@ -88,7 +88,7 @@ pub struct RouteReport {
     /// Flattened facts (with entity_canonical + source_inbox_id), the input
     /// step5 accumulates across the run.
     pub new_facts: Vec<Value>,
-    pub created_note_id: Option<i64>,
+    pub created_note_id: Option<String>,
     pub project_syntheses: Vec<ProjectSynthesis>,
     pub fast_exit: bool,
 }
@@ -137,10 +137,14 @@ impl Brain {
         classified: &Value,
         ctx: &RouteContext,
     ) -> Result<RouteReport, CoreError> {
-        let capture_id = entry
-            .get("id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| CoreError::Storage("entry.id missing".into()))?;
+        // uuid string post-SYN-112; legacy integer ids (golden corpus,
+        // pre-migration callers) are accepted as their text form.
+        let capture_id: String = match entry.get("id") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => return Err(CoreError::Storage("entry.id missing".into())),
+        };
+        let capture_id = capture_id.as_str();
         let content = entry.get("content").and_then(Value::as_str).unwrap_or("");
 
         let mut report = RouteReport::default();
@@ -201,7 +205,7 @@ impl Brain {
         }
 
         conn.execute_batch("BEGIN")?;
-        let mut pending_note_vec: Option<(i64, String)> = None;
+        let mut pending_note_vec: Option<(String, String)> = None;
         let r = (|| -> Result<(), CoreError> {
             if let Some(resolved) = &resolved {
                 report.entity_ids =
@@ -209,7 +213,7 @@ impl Brain {
             }
 
             // Atomic note (SYN-56/58/85 gates).
-            let mut created_note_id: Option<i64> = None;
+            let mut created_note_id: Option<String> = None;
             if !atomic.trim().is_empty() && (!is_ephemeral || durable_note) {
                 let mut mentioned: Vec<String> = arr(classified.get("entities"))
                     .iter()
@@ -254,14 +258,14 @@ impl Brain {
                     truthy(classified.get("event_recurring")),
                     review_status,
                 )?;
-                created_note_id = Some(note_id);
+                created_note_id = Some(note_id.clone());
                 let title: String = if summary.is_empty() { atomic.trim() } else { summary }
                     .chars()
                     .take(60)
                     .collect();
                 pending_note_vec = Some((note_id, format!("{title}\n{}", atomic.trim())));
             }
-            report.created_note_id = created_note_id;
+            report.created_note_id = created_note_id.clone();
 
             // Project entries — N per capture, dedup by lowercased canonical.
             let mut seen_projects: HashSet<String> = HashSet::new();
@@ -298,7 +302,7 @@ impl Brain {
                     &conn,
                     capture_id,
                     attach_content.trim(),
-                    created_note_id,
+                    created_note_id.as_deref(),
                 )?;
             }
 
@@ -322,7 +326,7 @@ impl Brain {
         // Post-commit, best-effort — mirrors the deferred vec flush.
         if let Some((note_id, text)) = pending_note_vec {
             if let Some(vec) = self.embed(&text) {
-                let _ = self.storage.upsert_note_vector(note_id, &vec);
+                let _ = self.storage.upsert_note_vector(&note_id, &vec);
             }
         }
 
@@ -356,7 +360,7 @@ impl Brain {
         confidence: f64,
         source_inbox_id: Value,
         persistence_value: i64,
-        provenance_capture_id: Option<i64>,
+        provenance_capture_id: Option<String>,
         category: Value,
     ) -> Result<String, CoreError> {
         let conn = self.storage.lock()?;
@@ -429,9 +433,11 @@ impl Brain {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             let row = find_existing_entity(&conn, entity_name, &[])?;
-            let prov_id: Option<i64> = match pf.get("source_inbox_id") {
-                Some(Value::Number(n)) => n.as_i64(),
-                Some(Value::String(s)) => s.parse().ok(),
+            // Post-SYN-112 payloads carry uuid strings; a pre-migration
+            // number is kept verbatim (same dangling-ref policy as migrate).
+            let prov_id: Option<String> = match pf.get("source_inbox_id") {
+                Some(Value::Number(n)) => Some(n.to_string()),
+                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
                 _ => None,
             };
             let entity_id = match row {
@@ -509,7 +515,7 @@ impl Brain {
         conn: &Connection,
         classified: &Value,
         resolved: &[Resolved],
-        source_inbox_id: i64,
+        source_inbox_id: &str,
         anchors_durable_note: bool,
         ctx: &RouteContext,
     ) -> Result<Vec<String>, CoreError> {
@@ -691,7 +697,7 @@ impl Brain {
                             *confidence,
                             Value::String(source_inbox_id.to_string()),
                             persistence_value(fact),
-                            Some(source_inbox_id),
+                            Some(source_inbox_id.to_string()),
                             fact.get("category").cloned().unwrap_or(Value::Null),
                         )?;
                     }
@@ -775,7 +781,7 @@ impl Brain {
         new_id: &str,
         new_name: &str,
         new_type: Option<&str>,
-        capture_id: i64,
+        capture_id: &str,
     ) -> Result<(), CoreError> {
         if new_name.is_empty() {
             return Ok(());
@@ -839,9 +845,9 @@ impl Brain {
     fn propose_project_attach_if_similar(
         &self,
         conn: &Connection,
-        capture_id: i64,
+        capture_id: &str,
         content: &str,
-        note_id: Option<i64>,
+        note_id: Option<&str>,
     ) -> Result<bool, CoreError> {
         if content.trim().is_empty() {
             return Ok(false);
@@ -1104,7 +1110,7 @@ fn upsert_entity(
     entity_data: &Value,
     existing: Option<&Map<String, Value>>,
     facts: &[Value],
-    capture_id: i64,
+    capture_id: &str,
     status: &str,
     today: &str,
 ) -> Result<String, CoreError> {
@@ -1201,7 +1207,7 @@ fn record_merge_proposal(
     existing_id: &str,
     score: f64,
     reason: &str,
-    capture_id: i64,
+    capture_id: &str,
 ) -> Result<bool, CoreError> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entity_merge_proposals \
@@ -1232,7 +1238,7 @@ fn insert_fact(
     confidence: f64,
     source_inbox_id: Value,
     persistence_value: i64,
-    provenance_capture_id: Option<i64>,
+    provenance_capture_id: Option<String>,
     category: Value,
 ) -> Result<String, CoreError> {
     let fact_id = new_uuid();
@@ -1321,7 +1327,7 @@ fn json_scalar_to_sql(v: &Value) -> SqlV {
     }
 }
 
-fn mark(conn: &Connection, entry_id: i64, now: &str, status: &str) -> Result<(), CoreError> {
+fn mark(conn: &Connection, entry_id: &str, now: &str, status: &str) -> Result<(), CoreError> {
     conn.execute(
         "UPDATE inbox SET processed_at=?1, status=?2, error=NULL WHERE id=?3",
         params![now, status, entry_id],
@@ -1403,12 +1409,12 @@ fn persist_atomic_note(
     content: &str,
     summary: &str,
     entities_mentioned: &[String],
-    capture_id: i64,
+    capture_id: &str,
     kind: &str,
     event_date: Option<&str>,
     event_recurring: bool,
     review_status: &str,
-) -> Result<i64, CoreError> {
+) -> Result<String, CoreError> {
     let kind = if ["note", "task", "event"].contains(&kind) { kind } else { "note" };
     let review_status = if ["confirmed", "pending"].contains(&review_status) {
         review_status
@@ -1420,12 +1426,14 @@ fn persist_atomic_note(
         .take(60)
         .collect();
     let durable = kind == "event" || kind == "task";
+    let note_id = new_uuid();
     conn.execute(
         "INSERT INTO atomic_notes \
-         (title, content, summary, entities_mentioned, memory_strength, provenance_capture_id, \
-          kind, event_date, event_recurring, review_status) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         (id, title, content, summary, entities_mentioned, memory_strength, \
+          provenance_capture_id, kind, event_date, event_recurring, review_status) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
+            note_id,
             title,
             content,
             summary,
@@ -1438,14 +1446,14 @@ fn persist_atomic_note(
             review_status,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(note_id)
 }
 
 fn persist_project_entry(
     conn: &Connection,
     canonical: &str,
     content: &str,
-    capture_id: i64,
+    capture_id: &str,
     is_new_project: bool,
 ) -> Result<ProjectSynthesis, CoreError> {
     let existing: Option<String> = {
@@ -1513,7 +1521,7 @@ fn reactivate_notes_for_entities(
     entity_names: &[String],
     now_sql: &str,
 ) -> Result<(), CoreError> {
-    let mut ids: HashSet<i64> = HashSet::new();
+    let mut ids: HashSet<String> = HashSet::new();
     for name in entity_names {
         if name.is_empty() {
             continue;
@@ -1522,7 +1530,7 @@ fn reactivate_notes_for_entities(
         let mut stmt =
             conn.prepare("SELECT id FROM atomic_notes WHERE entities_mentioned LIKE ?1")?;
         let rows = stmt
-            .query_map(params![pattern], |r| r.get::<_, i64>(0))?
+            .query_map(params![pattern], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.extend(rows);
     }

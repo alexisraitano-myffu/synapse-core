@@ -13,6 +13,7 @@
 
 mod embedder;
 mod llm;
+mod migrate;
 mod routing;
 mod schema;
 mod sql;

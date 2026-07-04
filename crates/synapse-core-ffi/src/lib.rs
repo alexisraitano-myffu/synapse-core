@@ -59,7 +59,7 @@ impl Embedder {
 /// A note KNN hit; `distance` is sqlite-vec's L2 on unit vectors ([0, 2]).
 #[derive(uniffi::Record)]
 pub struct NoteHit {
-    pub note_id: i64,
+    pub note_id: String,
     pub distance: f64,
 }
 
@@ -99,16 +99,16 @@ impl Storage {
         Ok(Arc::new(Self { inner }))
     }
 
-    pub fn upsert_note_vector(&self, note_id: i64, embedding: Vec<u8>) -> Result<(), CoreError> {
-        Ok(self.inner.upsert_note_vector(note_id, &embedding)?)
+    pub fn upsert_note_vector(&self, note_id: String, embedding: Vec<u8>) -> Result<(), CoreError> {
+        Ok(self.inner.upsert_note_vector(&note_id, &embedding)?)
     }
 
-    pub fn delete_note_vector(&self, note_id: i64) -> Result<(), CoreError> {
-        Ok(self.inner.delete_note_vector(note_id)?)
+    pub fn delete_note_vector(&self, note_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.delete_note_vector(&note_id)?)
     }
 
-    pub fn get_note_vector(&self, note_id: i64) -> Result<Option<Vec<u8>>, CoreError> {
-        Ok(self.inner.get_note_vector(note_id)?)
+    pub fn get_note_vector(&self, note_id: String) -> Result<Option<Vec<u8>>, CoreError> {
+        Ok(self.inner.get_note_vector(&note_id)?)
     }
 
     pub fn search_notes(&self, query: Vec<u8>, k: u32) -> Result<Vec<NoteHit>, CoreError> {

@@ -12,29 +12,34 @@ use rusqlite::Connection;
 use crate::embedder::EMBEDDING_DIM;
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // note_id TEXT: vec0 supports declared text primary keys (verified on
+    // sqlite-vec 0.1.9) — the vector key IS the atomic_notes uuid.
     let vec_table = format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS atomic_notes_vec \
-         USING vec0(embedding float[{EMBEDDING_DIM}])"
+         USING vec0(note_id TEXT PRIMARY KEY, embedding float[{EMBEDDING_DIM}])"
     );
 
     let creates: &[&str] = &[
+        // SYN-112: uuid TEXT pks everywhere — auto-increment ids cannot give
+        // rows a cross-device identity. inbox.id doubles as the capture's
+        // client uuid when one is provided (idempotency moves onto the pk).
         "CREATE TABLE IF NOT EXISTS inbox (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            id           TEXT NOT NULL PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
             content      TEXT NOT NULL,
             source       TEXT NOT NULL DEFAULT 'manual',
             created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             processed_at TIMESTAMP
         )",
         "CREATE TABLE IF NOT EXISTS atomic_notes (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         TEXT NOT NULL PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
             title      TEXT,
             content    TEXT NOT NULL,
             source_ids TEXT,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
-        // vec_table (parallel vector index — rowid mirrors atomic_notes.id)
-        // is executed separately below because of the dim interpolation.
+        // vec_table (parallel vector index keyed by note uuid) is executed
+        // separately below because of the dim interpolation.
         "CREATE TABLE IF NOT EXISTS knowledge_graph (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_a   TEXT NOT NULL,
@@ -134,7 +139,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "CREATE TABLE IF NOT EXISTS project_entries (
             id                TEXT PRIMARY KEY,
             project_id        TEXT NOT NULL REFERENCES entities(id),
-            capture_id        INTEGER NOT NULL REFERENCES inbox(id),
+            capture_id        TEXT NOT NULL REFERENCES inbox(id),
             content           TEXT NOT NULL,
             kind              TEXT NOT NULL DEFAULT 'note',
             created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -160,7 +165,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             existing_entity_id    TEXT NOT NULL REFERENCES entities(id),
             similarity_score      REAL NOT NULL,
             similarity_reason     TEXT,
-            evidence_capture_id   INTEGER REFERENCES inbox(id),
+            evidence_capture_id   TEXT REFERENCES inbox(id),
             status                TEXT NOT NULL DEFAULT 'pending',
             created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             resolved_at           TIMESTAMP,
@@ -176,7 +181,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             id                  TEXT PRIMARY KEY,
             proposed_type       TEXT NOT NULL,
             reason              TEXT,
-            evidence_capture_id INTEGER REFERENCES inbox(id),
+            evidence_capture_id TEXT REFERENCES inbox(id),
             candidate_entity_id TEXT REFERENCES entities(id),
             status              TEXT NOT NULL DEFAULT 'pending',
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -185,8 +190,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         // Soft « rattacher à un projet existant ? » proposals (« À valider »).
         "CREATE TABLE IF NOT EXISTS project_attach_proposals (
             id               TEXT PRIMARY KEY,
-            capture_id       INTEGER NOT NULL REFERENCES inbox(id),
-            note_id          INTEGER REFERENCES atomic_notes(id),
+            capture_id       TEXT NOT NULL REFERENCES inbox(id),
+            note_id          TEXT REFERENCES atomic_notes(id),
             project_id       TEXT NOT NULL REFERENCES entities(id),
             content          TEXT NOT NULL,
             similarity_score REAL NOT NULL,
@@ -240,10 +245,10 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE inbox ADD COLUMN captured_at TIMESTAMP",
         "ALTER TABLE inbox ADD COLUMN status TEXT DEFAULT 'queued'",
         // SYN-41 — provenance back-link to the immutable inbox row.
-        "ALTER TABLE entities     ADD COLUMN provenance_capture_id INTEGER REFERENCES inbox(id)",
-        "ALTER TABLE facts        ADD COLUMN provenance_capture_id INTEGER REFERENCES inbox(id)",
-        "ALTER TABLE atomic_notes ADD COLUMN provenance_capture_id INTEGER REFERENCES inbox(id)",
-        "ALTER TABLE relations    ADD COLUMN provenance_capture_id INTEGER REFERENCES inbox(id)",
+        "ALTER TABLE entities     ADD COLUMN provenance_capture_id TEXT REFERENCES inbox(id)",
+        "ALTER TABLE facts        ADD COLUMN provenance_capture_id TEXT REFERENCES inbox(id)",
+        "ALTER TABLE atomic_notes ADD COLUMN provenance_capture_id TEXT REFERENCES inbox(id)",
+        "ALTER TABLE relations    ADD COLUMN provenance_capture_id TEXT REFERENCES inbox(id)",
         // SYN-44 — append vs from-scratch rebuild on project_state_versions.
         "ALTER TABLE project_state_versions ADD COLUMN kind TEXT NOT NULL DEFAULT 'append'",
         // SYN-39 — soft-link a merged entity to its absorber.
