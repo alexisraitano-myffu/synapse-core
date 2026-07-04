@@ -102,7 +102,7 @@ impl Storage {
         })
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>, CoreError> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, CoreError> {
         self.conn
             .lock()
             .map_err(|_| CoreError::Storage("storage mutex poisoned".into()))
@@ -193,10 +193,54 @@ impl Storage {
         type_filter: Option<&str>,
         exclude_ids: &[String],
     ) -> Result<Vec<EntityHit>, CoreError> {
+        let conn = self.lock()?;
+        search_entities_on(&conn, query, limit, min_score, type_filter, exclude_ids)
+    }
+
+    /// Top-K resources by similarity on their embedded summary.
+    pub fn search_resources(&self, query: &[u8], limit: u32) -> Result<Vec<ResourceHit>, CoreError> {
+        let q = parse_query(query)?;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, url, summary, embedding FROM resources \
+             WHERE embedding IS NOT NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut scored: Vec<ResourceHit> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let blob: Vec<u8> = row.get(4)?;
+            let Some(score) = score_against(&q, &blob) else {
+                continue;
+            };
+            let title: Option<String> = row.get(1)?;
+            let url: Option<String> = row.get(2)?;
+            scored.push(ResourceHit {
+                id: row.get(0)?,
+                title: title.or_else(|| url.clone()),
+                url,
+                summary: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                score,
+            });
+        }
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        scored.truncate(limit as usize);
+        Ok(scored)
+    }
+}
+
+/// Same-connection variant of the entity similarity scan, callable from
+/// routing code that already holds the storage connection (in-transaction).
+pub(crate) fn search_entities_on(
+    conn: &Connection,
+    query: &[u8],
+    limit: u32,
+    min_score: f64,
+    type_filter: Option<&str>,
+    exclude_ids: &[String],
+) -> Result<Vec<EntityHit>, CoreError> {
+    {
         let q = parse_query(query)?;
         let exclude: HashSet<&str> = exclude_ids.iter().map(String::as_str).collect();
-        let conn = self.lock()?;
-
         let base = "SELECT id, canonical_name, type, summary, embedding FROM entities \
                     WHERE embedding IS NOT NULL AND merged_into_id IS NULL \
                     AND status = 'active' AND archived_at IS NULL";
@@ -242,36 +286,6 @@ impl Storage {
 
         // Stable sort, like Python's `sort(key=lambda x: -x[0])`: ties keep
         // the table scan order.
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-        scored.truncate(limit as usize);
-        Ok(scored)
-    }
-
-    /// Top-K resources by similarity on their embedded summary.
-    pub fn search_resources(&self, query: &[u8], limit: u32) -> Result<Vec<ResourceHit>, CoreError> {
-        let q = parse_query(query)?;
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, title, url, summary, embedding FROM resources \
-             WHERE embedding IS NOT NULL",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut scored: Vec<ResourceHit> = Vec::new();
-        while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(4)?;
-            let Some(score) = score_against(&q, &blob) else {
-                continue;
-            };
-            let title: Option<String> = row.get(1)?;
-            let url: Option<String> = row.get(2)?;
-            scored.push(ResourceHit {
-                id: row.get(0)?,
-                title: title.or_else(|| url.clone()),
-                url,
-                summary: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                score,
-            });
-        }
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         scored.truncate(limit as usize);
         Ok(scored)

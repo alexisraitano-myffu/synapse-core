@@ -16,9 +16,12 @@ ort-dynamic = ["fastembed/ort-load-dynamic"]
 [dependencies]
 fastembed = { workspace = true }
 thiserror = { workspace = true }
-serde_json = "1"
+# preserve_order: Python dict insertion order shapes JSON bytes that get
+# embedded (attributes in entity_embedding_text) — BTreeMap would reorder.
+serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

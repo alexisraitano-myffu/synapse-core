@@ -22,6 +22,7 @@ repository = "https://github.com/alexisraitano/synapse-core"
 synapse-core = { path = "crates/synapse-core" }
 fastembed = { version = "5.17", default-features = false }
 thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
 # bundled: the same SQLite compiled into the core on every platform (macOS,
 # Android, iOS), instead of whatever the OS ships.
 rusqlite = { version = "0.40", features = ["bundled"] }

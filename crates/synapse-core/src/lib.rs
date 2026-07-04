@@ -12,10 +12,12 @@
 //!   their own SQL access for non-vector columns.
 
 mod embedder;
+mod routing;
 mod schema;
 mod sql;
 mod storage;
 
 pub use embedder::{CoreError, Embedder, EMBEDDING_DIM};
+pub use routing::{Brain, ProjectSynthesis, RouteContext, RouteReport};
 pub use sql::{connect, SqlConnection, SqlResult, SqlValue};
 pub use storage::{EntityHit, NoteHit, ResourceHit, Storage};
