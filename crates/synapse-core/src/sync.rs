@@ -76,6 +76,7 @@ fn synced_tables() -> &'static [(&'static str, &'static str)] {
         ("active_entity_types", "type"),
         ("entity_type_proposals", "id"),
         ("project_attach_proposals", "id"),
+        ("sync_owner", "id"),
     ]
 }
 

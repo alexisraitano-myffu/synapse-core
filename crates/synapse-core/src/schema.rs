@@ -212,6 +212,16 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             label      TEXT NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )",
+        // SYN-112 (T3) — the replicated cycle owner-lock: the ONE device
+        // allowed to run the Dream Cycle. Singleton row (id = 'owner'); a
+        // claim bumps epoch, concurrent claims are settled by the sync
+        // engine's per-column LWW (one claim = one HLC for all columns).
+        "CREATE TABLE IF NOT EXISTS sync_owner (
+            id         TEXT PRIMARY KEY,
+            device_id  TEXT NOT NULL,
+            epoch      INTEGER NOT NULL DEFAULT 1,
+            claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
     ];
 
     for stmt in creates {
