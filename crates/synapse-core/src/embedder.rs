@@ -21,6 +21,8 @@ pub enum CoreError {
     ModelLoad(String),
     #[error("embedding failed: {0}")]
     Embedding(String),
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 /// Text embedder backed by a user-provided ONNX model directory.
