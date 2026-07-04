@@ -9,3 +9,8 @@ __pycache__/
 models/
 .DS_Store
 bindings/
+
+# House tooling (local only)
+graphify-out/
+CLAUDE.local.md
+.claude/
