@@ -248,12 +248,201 @@ fn connect(py: Python<'_>, db_path: &str) -> PyResult<SqlConnection> {
     Ok(SqlConnection { inner: Some(inner) })
 }
 
+fn brain_err(e: synapse_core::CoreError) -> PyErr {
+    use pyo3::exceptions::{PyConnectionError, PyValueError};
+    match e {
+        // Host policy: HTTP/network aborts the run (like anthropic.APIError),
+        // a content error only fails the one entry.
+        synapse_core::CoreError::LlmHttp(msg) => PyConnectionError::new_err(msg),
+        synapse_core::CoreError::LlmContent(msg) => PyValueError::new_err(msg),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
+
+/// The Dream Cycle brain (SYN-111): deterministic routing + classifier
+/// orchestration. JSON strings across the boundary — the classified dict is
+/// polymorphic and the report is consumed as a dict anyway.
+#[pyclass]
+struct Brain {
+    inner: synapse_core::Brain,
+}
+
+#[pymethods]
+impl Brain {
+    #[new]
+    #[pyo3(signature = (db_path, model_dir=None))]
+    fn new(py: Python<'_>, db_path: &str, model_dir: Option<&str>) -> PyResult<Self> {
+        let inner = py
+            .detach(|| synapse_core::Brain::open(db_path, model_dir))
+            .map_err(brain_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Route one capture. Returns the RouteReport as JSON:
+    /// {entity_ids, new_facts, created_note_id, fast_exit, project_syntheses}.
+    #[pyo3(signature = (entry_json, classified_json, now, today, intentions_cutoff, now_sql))]
+    fn route_capture(
+        &self,
+        py: Python<'_>,
+        entry_json: &str,
+        classified_json: &str,
+        now: &str,
+        today: &str,
+        intentions_cutoff: &str,
+        now_sql: &str,
+    ) -> PyResult<String> {
+        let entry: serde_json::Value =
+            serde_json::from_str(entry_json).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let classified: serde_json::Value = serde_json::from_str(classified_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let ctx = synapse_core::RouteContext {
+            now: now.to_string(),
+            today: today.to_string(),
+            intentions_cutoff: intentions_cutoff.to_string(),
+            now_sql: now_sql.to_string(),
+        };
+        let report = py
+            .detach(|| self.inner.route_capture(&entry, &classified, &ctx))
+            .map_err(brain_err)?;
+        Ok(synapse_core::Brain::report_to_json(&report).to_string())
+    }
+
+    /// step5 — behavioral validation over the run's accumulated new facts.
+    fn validate_pending(&self, py: Python<'_>, new_facts_json: &str) -> PyResult<i64> {
+        let new_facts: Vec<serde_json::Value> = serde_json::from_str(new_facts_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        py.detach(|| self.inner.validate_pending(&new_facts))
+            .map_err(brain_err)
+    }
+
+    /// `messages.create` params for one capture (Batch API path) → JSON.
+    #[pyo3(signature = (content, day_context, model, prompts_dir, today))]
+    fn build_classify_params(
+        &self,
+        py: Python<'_>,
+        content: &str,
+        day_context: Option<&str>,
+        model: &str,
+        prompts_dir: &str,
+        today: &str,
+    ) -> PyResult<String> {
+        let config = synapse_core::LlmConfig {
+            model: model.to_string(),
+            api_key: String::new(),
+            base_url: None,
+            fuel_token: None,
+            prompts_dir: prompts_dir.to_string(),
+            today: today.to_string(),
+        };
+        let params = py
+            .detach(|| self.inner.build_classify_params(content, day_context, &config))
+            .map_err(brain_err)?;
+        Ok(params.to_string())
+    }
+
+    /// Synchronous classification (build + HTTP Anthropic + parse) → JSON.
+    /// Raises ConnectionError on HTTP/network failure (abort-the-run policy)
+    /// and ValueError on truncated/invalid content (fail-one-entry policy).
+    #[pyo3(signature = (content, day_context, model, api_key, prompts_dir, today,
+                        base_url=None, fuel_token=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn classify(
+        &self,
+        py: Python<'_>,
+        content: &str,
+        day_context: Option<&str>,
+        model: &str,
+        api_key: &str,
+        prompts_dir: &str,
+        today: &str,
+        base_url: Option<&str>,
+        fuel_token: Option<&str>,
+    ) -> PyResult<String> {
+        let config = synapse_core::LlmConfig {
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.map(String::from),
+            fuel_token: fuel_token.map(String::from),
+            prompts_dir: prompts_dir.to_string(),
+            today: today.to_string(),
+        };
+        let classified = py
+            .detach(|| self.inner.classify(content, day_context, &config))
+            .map_err(brain_err)?;
+        Ok(classified.to_string())
+    }
+
+    /// Shared fact write (SYN-37 supersede + dedup) for the validation /
+    /// reclassify endpoints. `value`/`source_inbox_id`/`category` are JSON
+    /// scalars (bound like Python bound the native values).
+    #[pyo3(signature = (entity_id, predicate, value_json, confidence,
+                        source_inbox_id_json="null", persistence_value=3,
+                        provenance_capture_id=None, category_json="null"))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_fact(
+        &self,
+        py: Python<'_>,
+        entity_id: &str,
+        predicate: &str,
+        value_json: &str,
+        confidence: f64,
+        source_inbox_id_json: &str,
+        persistence_value: i64,
+        provenance_capture_id: Option<i64>,
+        category_json: &str,
+    ) -> PyResult<String> {
+        let value: serde_json::Value = serde_json::from_str(value_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let source: serde_json::Value = serde_json::from_str(source_inbox_id_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let category: serde_json::Value = serde_json::from_str(category_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        py.detach(|| {
+            self.inner.insert_user_fact(
+                entity_id,
+                predicate,
+                value,
+                confidence,
+                source,
+                persistence_value,
+                provenance_capture_id,
+                category,
+            )
+        })
+        .map_err(brain_err)
+    }
+
+    /// Alias-aware entity resolution → entity id or None.
+    #[pyo3(signature = (canonical_name, aliases=None))]
+    fn find_entity(
+        &self,
+        py: Python<'_>,
+        canonical_name: &str,
+        aliases: Option<Vec<String>>,
+    ) -> PyResult<Option<String>> {
+        let aliases = aliases.unwrap_or_default();
+        py.detach(|| self.inner.find_entity(canonical_name, &aliases))
+            .map_err(brain_err)
+    }
+}
+
+/// Port of `_parse_classify_text` — shared by the host's Batch API path.
+#[pyfunction]
+#[pyo3(signature = (text, content_len, stop_reason=None))]
+fn parse_classify_text(text: &str, content_len: usize, stop_reason: Option<&str>) -> PyResult<String> {
+    synapse_core::parse_classify_text(text, content_len, stop_reason)
+        .map(|v| v.to_string())
+        .map_err(brain_err)
+}
+
 #[pymodule(name = "synapse_core")]
 fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Embedder>()?;
     m.add_class::<Storage>()?;
     m.add_class::<SqlConnection>()?;
+    m.add_class::<Brain>()?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_classify_text, m)?)?;
     m.add("EMBEDDING_DIM", synapse_core::EMBEDDING_DIM)?;
     Ok(())
 }

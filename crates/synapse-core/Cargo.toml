@@ -22,6 +22,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 uuid = { workspace = true }
+# Blocking HTTP for the classifier call; rustls so Android needs no OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -12,6 +12,10 @@ pub enum CoreError {
     Embedding { msg: String },
     #[error("storage error: {msg}")]
     Storage { msg: String },
+    #[error("llm http error: {msg}")]
+    LlmHttp { msg: String },
+    #[error("llm content error: {msg}")]
+    LlmContent { msg: String },
 }
 
 impl From<synapse_core::CoreError> for CoreError {
@@ -20,6 +24,8 @@ impl From<synapse_core::CoreError> for CoreError {
             synapse_core::CoreError::ModelLoad(msg) => CoreError::ModelLoad { msg },
             synapse_core::CoreError::Embedding(msg) => CoreError::Embedding { msg },
             synapse_core::CoreError::Storage(msg) => CoreError::Storage { msg },
+            synapse_core::CoreError::LlmHttp(msg) => CoreError::LlmHttp { msg },
+            synapse_core::CoreError::LlmContent(msg) => CoreError::LlmContent { msg },
         }
     }
 }
@@ -248,5 +254,79 @@ impl SqlConnection {
 
     pub fn last_insert_rowid(&self) -> Result<i64, CoreError> {
         Ok(self.inner.last_insert_rowid()?)
+    }
+}
+
+/// The Dream Cycle brain (SYN-111): deterministic routing + classifier
+/// orchestration. JSON strings across the boundary, same shapes as PyO3.
+#[derive(uniffi::Object)]
+pub struct Brain {
+    inner: synapse_core::Brain,
+}
+
+#[uniffi::export]
+impl Brain {
+    #[uniffi::constructor]
+    pub fn open(db_path: String, model_dir: Option<String>) -> Result<Arc<Self>, CoreError> {
+        let inner = synapse_core::Brain::open(&db_path, model_dir.as_deref())?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Route one capture; returns the RouteReport as JSON.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_capture(
+        &self,
+        entry_json: String,
+        classified_json: String,
+        now: String,
+        today: String,
+        intentions_cutoff: String,
+        now_sql: String,
+    ) -> Result<String, CoreError> {
+        let entry: serde_json::Value = serde_json::from_str(&entry_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        let classified: serde_json::Value = serde_json::from_str(&classified_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        let ctx = synapse_core::RouteContext {
+            now,
+            today,
+            intentions_cutoff,
+            now_sql,
+        };
+        let report = self.inner.route_capture(&entry, &classified, &ctx)?;
+        Ok(synapse_core::Brain::report_to_json(&report).to_string())
+    }
+
+    pub fn validate_pending(&self, new_facts_json: String) -> Result<i64, CoreError> {
+        let new_facts: Vec<serde_json::Value> = serde_json::from_str(&new_facts_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        Ok(self.inner.validate_pending(&new_facts)?)
+    }
+
+    /// Synchronous classification (prompt build + HTTP + parse) → JSON.
+    #[allow(clippy::too_many_arguments)]
+    pub fn classify(
+        &self,
+        content: String,
+        day_context: Option<String>,
+        model: String,
+        api_key: String,
+        prompts_dir: String,
+        today: String,
+        base_url: Option<String>,
+        fuel_token: Option<String>,
+    ) -> Result<String, CoreError> {
+        let config = synapse_core::LlmConfig {
+            model,
+            api_key,
+            base_url,
+            fuel_token,
+            prompts_dir,
+            today,
+        };
+        Ok(self
+            .inner
+            .classify(&content, day_context.as_deref(), &config)?
+            .to_string())
     }
 }

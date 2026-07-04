@@ -19,6 +19,7 @@ ort-dynamic = ["synapse-core/ort-dynamic"]
 synapse-core = { path = "../synapse-core", version = "0.1.0", default-features = false }
 uniffi = { version = "0.32", features = ["cli"] }
 thiserror = { workspace = true }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [[bin]]
 name = "uniffi-bindgen"

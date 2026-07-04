@@ -318,6 +318,54 @@ impl Brain {
         Ok(report)
     }
 
+    /// Report → JSON for the FFI/PyO3 boundary.
+    pub fn report_to_json(report: &RouteReport) -> Value {
+        json!({
+            "entity_ids": report.entity_ids,
+            "new_facts": report.new_facts,
+            "created_note_id": report.created_note_id,
+            "fast_exit": report.fast_exit,
+            "project_syntheses": report.project_syntheses.iter().map(|s| json!({
+                "project_id": s.project_id,
+                "project_name": s.project_name,
+                "entry_content": s.entry_content,
+                "entry_count": s.entry_count,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Host-facing `insert_fact` (validation endpoints, reclassify) — same
+    /// dedup-reinforce + SYN-37 supersede as the routing path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_user_fact(
+        &self,
+        entity_id: &str,
+        predicate: &str,
+        value: Value,
+        confidence: f64,
+        source_inbox_id: Value,
+        persistence_value: i64,
+        provenance_capture_id: Option<i64>,
+        category: Value,
+    ) -> Result<String, CoreError> {
+        let conn = self.storage.lock()?;
+        insert_fact(
+            &conn, entity_id, predicate, value, confidence, source_inbox_id,
+            persistence_value, provenance_capture_id, category,
+        )
+    }
+
+    /// Host-facing `_find_existing_entity` (alias-aware) → entity id.
+    pub fn find_entity(
+        &self,
+        canonical_name: &str,
+        aliases: &[String],
+    ) -> Result<Option<String>, CoreError> {
+        let conn = self.storage.lock()?;
+        Ok(find_existing_entity(&conn, canonical_name, aliases)?
+            .and_then(|row| row.get("id").and_then(Value::as_str).map(String::from)))
+    }
+
     /// Port of `step5_validate_pending`: corroborated pending facts promote.
     pub fn validate_pending(&self, new_facts: &[Value]) -> Result<i64, CoreError> {
         let conn = self.storage.lock()?;
