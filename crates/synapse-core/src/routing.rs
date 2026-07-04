@@ -21,6 +21,7 @@
 //!   normalizer, so serde's compact form is fine there.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rusqlite::types::Value as SqlV;
 use rusqlite::{params, params_from_iter, Connection};
@@ -98,16 +99,26 @@ pub struct RouteReport {
 /// around `embed_text` (skip silently / leave the note unvectorized).
 pub struct Brain {
     pub storage: Storage,
-    embedder: Option<Embedder>,
+    embedder: Option<Arc<Embedder>>,
 }
 
 impl Brain {
     pub fn open(db_path: &str, model_dir: Option<&str>) -> Result<Self, CoreError> {
-        let storage = Storage::open(db_path)?;
         let embedder = match model_dir {
-            Some(dir) => Some(Embedder::new(dir)?),
+            Some(dir) => Some(Arc::new(Embedder::new(dir)?)),
             None => None,
         };
+        Self::open_shared(db_path, embedder)
+    }
+
+    /// Open sharing an already-loaded embedder (the model weighs ~235 MB and
+    /// takes seconds to load; hosts opening several Brains — e.g. a test
+    /// suite with one database per test — must not pay it per instance).
+    pub fn open_shared(
+        db_path: &str,
+        embedder: Option<Arc<Embedder>>,
+    ) -> Result<Self, CoreError> {
+        let storage = Storage::open(db_path)?;
         Ok(Self { storage, embedder })
     }
 
@@ -1609,6 +1620,15 @@ fn resolve_date(value: &str, today: &str) -> String {
     if v.len() == 4 && v.chars().all(|c| c.is_ascii_digit()) {
         return format!("{v}-{}-01", &today[5..7]);
     }
+    // Partial ISO month-day ("07-04") → current year prepended (dateparser
+    // read these MDY and filled the year from the current date).
+    if v.len() == 5
+        && bytes[0..2].iter().all(u8::is_ascii_digit)
+        && bytes[2] == b'-'
+        && bytes[3..5].iter().all(u8::is_ascii_digit)
+    {
+        return format!("{}-{v}", &today[0..4]);
+    }
     let lower = v.to_lowercase();
     if let Some(days) = match lower.as_str() {
         "today" | "aujourd'hui" => Some(0),
@@ -1678,6 +1698,7 @@ mod tests {
     fn date_resolution_covers_recorded_shapes() {
         assert_eq!(resolve_date("2026-06-16", "2026-07-04"), "2026-06-16");
         assert_eq!(resolve_date("1993", "2026-07-04"), "1993-07-01");
+        assert_eq!(resolve_date("07-04", "2026-07-04"), "2026-07-04");
         assert_eq!(resolve_date("next week", "2026-07-04"), "2026-07-11");
         assert_eq!(resolve_date("bientôt", "2026-07-04"), "bientôt");
         assert_eq!(add_days_iso("2026-12-28", 7), "2027-01-04");

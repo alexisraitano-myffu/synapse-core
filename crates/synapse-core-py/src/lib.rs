@@ -50,15 +50,19 @@ fn from_sql_value<'py>(py: Python<'py>, v: SqlValue) -> PyResult<Bound<'py, PyAn
 ///     vec = e.embed("some text")   # list[float], 384-d, L2-normalized
 #[pyclass]
 struct Embedder {
-    inner: synapse_core::Embedder,
+    inner: std::sync::Arc<synapse_core::Embedder>,
 }
 
 #[pymethods]
 impl Embedder {
     #[new]
-    fn new(model_dir: &str) -> PyResult<Self> {
-        let inner = synapse_core::Embedder::new(model_dir).map_err(core_err)?;
-        Ok(Self { inner })
+    fn new(py: Python<'_>, model_dir: &str) -> PyResult<Self> {
+        let inner = py
+            .detach(|| synapse_core::Embedder::new(model_dir))
+            .map_err(core_err)?;
+        Ok(Self {
+            inner: std::sync::Arc::new(inner),
+        })
     }
 
     fn embed(&self, py: Python<'_>, text: &str) -> PyResult<Vec<f32>> {
@@ -269,11 +273,22 @@ struct Brain {
 
 #[pymethods]
 impl Brain {
+    /// `embedder`: share one loaded model across Brains (per-test databases
+    /// must not reload 235 MB each). `model_dir` loads a private one.
     #[new]
-    #[pyo3(signature = (db_path, model_dir=None))]
-    fn new(py: Python<'_>, db_path: &str, model_dir: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (db_path, model_dir=None, embedder=None))]
+    fn new(
+        py: Python<'_>,
+        db_path: &str,
+        model_dir: Option<&str>,
+        embedder: Option<PyRef<'_, Embedder>>,
+    ) -> PyResult<Self> {
+        let shared = embedder.map(|e| e.inner.clone());
         let inner = py
-            .detach(|| synapse_core::Brain::open(db_path, model_dir))
+            .detach(|| match shared {
+                Some(e) => synapse_core::Brain::open_shared(db_path, Some(e)),
+                None => synapse_core::Brain::open(db_path, model_dir),
+            })
             .map_err(brain_err)?;
         Ok(Self { inner })
     }
