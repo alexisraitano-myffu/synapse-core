@@ -171,6 +171,27 @@ impl Storage {
             .collect())
     }
 
+    // ── P2P sync (SYN-112 T3): engine surface for the phase-3 transport ──
+
+    fn sync_device_id(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| self.inner.sync_device_id()).map_err(core_err)
+    }
+
+    /// Changeset (protocol-v1 JSON string) of everything journaled after
+    /// `since`; paginate with the returned `next` cursor while `has_more`.
+    #[pyo3(signature = (since, limit=10000))]
+    fn sync_changes_since(&self, py: Python<'_>, since: i64, limit: i64) -> PyResult<String> {
+        py.detach(|| self.inner.sync_changes_since(since, limit))
+            .map_err(core_err)
+    }
+
+    /// Merge a peer's changeset (per-column LWW) → JSON report. The caller
+    /// re-embeds the notes listed under `notes_changed`.
+    fn sync_apply(&self, py: Python<'_>, changes_json: &str) -> PyResult<String> {
+        py.detach(|| self.inner.sync_apply(changes_json))
+            .map_err(core_err)
+    }
+
     /// → [(id, title, url, summary, score)], score-descending.
     #[pyo3(signature = (query, limit=10))]
     fn search_resources(

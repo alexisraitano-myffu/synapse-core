@@ -18,6 +18,7 @@ mod routing;
 mod schema;
 mod sql;
 mod storage;
+mod sync;
 
 pub use embedder::{CoreError, Embedder, EMBEDDING_DIM};
 pub use llm::{parse_classify_text, LlmConfig};

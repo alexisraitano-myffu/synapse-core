@@ -99,9 +99,32 @@ impl Storage {
         schema::init_schema(&conn)?;
         // SYN-112: legacy integer ids → uuid TEXT pks (no-op once done).
         crate::migrate::migrate_integer_ids(&conn)?;
+        // SYN-112 (T3): sync journal + triggers. After the uuid migration so
+        // the journal only ever sees TEXT pks.
+        crate::sync::install(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    // ── P2P sync (SYN-112 T3) — engine surface, transport comes in phase 3 ──
+
+    pub fn sync_device_id(&self) -> Result<String, CoreError> {
+        let conn = self.lock()?;
+        crate::sync::device_id(&conn)
+    }
+
+    /// Changeset (protocol-v1 JSON) of everything journaled after `since`.
+    pub fn sync_changes_since(&self, since: i64, limit: i64) -> Result<String, CoreError> {
+        let conn = self.lock()?;
+        crate::sync::changes_since(&conn, since, limit)
+    }
+
+    /// Merge a peer's changeset (LWW per column) → JSON report. The caller
+    /// re-embeds the notes listed in the report's `notes_changed`.
+    pub fn sync_apply(&self, changes_json: &str) -> Result<String, CoreError> {
+        let conn = self.lock()?;
+        crate::sync::apply_changes(&conn, changes_json)
     }
 
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, CoreError> {
