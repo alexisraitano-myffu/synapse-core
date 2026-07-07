@@ -1,0 +1,136 @@
+# T4 (SYN-113) phase 1 — the iOS toolchain wall, entirely in CI (no local
+# Xcode). Produces SynapseCore.xcframework + UniFFI Swift bindings, and proves
+# embedding parity by running the same probe on macOS and on an iOS simulator.
+#
+# ONNX Runtime on iOS: the official CocoaPods archive (onnxruntime-c) ships a
+# STATIC framework — no dylib to dlopen, so unlike Android (ort-load-dynamic +
+# AAR) we build with no ort feature and point ORT_LIB_LOCATION at the slice's
+# static archive. The app must link onnxruntime.xcframework next to ours.
+name: ios-core
+
+on:
+  push:
+    branches: [ci/ios]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must satisfy ort 2.0.0-rc.12 (ONNX Runtime API >= 1.24); same line as the
+  # Android AAR (com.microsoft.onnxruntime:onnxruntime-android:1.27.0).
+  ORT_IOS_VERSION: "1.27.0"
+  MODEL_REPO: qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q
+
+jobs:
+  xcframework:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch onnxruntime iOS static framework
+        run: |
+          set -euo pipefail
+          URL=$(pod spec cat onnxruntime-c --version="$ORT_IOS_VERSION" | jq -r '.source.http')
+          echo "pod archive: $URL"
+          curl -sSfL "$URL" -o /tmp/ort-pod.zip
+          unzip -q /tmp/ort-pod.zip -d /tmp/ort-pod
+          XC=$(find /tmp/ort-pod -type d -name "onnxruntime.xcframework" | head -1)
+          echo "xcframework: $XC"
+          ls "$XC"
+          mkdir -p ort-libs/device ort-libs/sim
+          cp "$XC"/ios-arm64/onnxruntime.framework/onnxruntime ort-libs/device/libonnxruntime.a
+          SIM_SLICE=$(ls -d "$XC"/ios-*simulator* | head -1)
+          cp "$SIM_SLICE"/onnxruntime.framework/onnxruntime ort-libs/sim/libonnxruntime.a
+          cp -R "$XC" ort-libs/onnxruntime.xcframework
+
+      - name: Build FFI staticlib (device)
+        env:
+          ORT_LIB_LOCATION: ${{ github.workspace }}/ort-libs/device
+        run: |
+          cargo build -p synapse-core-ffi --release --no-default-features \
+            --target aarch64-apple-ios
+
+      - name: Build FFI staticlib (simulator)
+        env:
+          ORT_LIB_LOCATION: ${{ github.workspace }}/ort-libs/sim
+        run: |
+          cargo build -p synapse-core-ffi --release --no-default-features \
+            --target aarch64-apple-ios-sim
+
+      - name: Generate Swift bindings
+        run: |
+          set -euo pipefail
+          cargo build -p synapse-core-ffi --release
+          cargo run -p synapse-core-ffi --release --bin uniffi-bindgen -- \
+            generate --library target/release/libsynapse_core_ffi.dylib \
+            --language swift --out-dir target/swift
+          ls -la target/swift
+
+      - name: Assemble SynapseCore.xcframework
+        run: |
+          set -euo pipefail
+          mkdir -p target/xc-headers
+          cp target/swift/*FFI.h target/xc-headers/
+          cp target/swift/*FFI.modulemap target/xc-headers/module.modulemap
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libsynapse_core_ffi.a \
+              -headers target/xc-headers \
+            -library target/aarch64-apple-ios-sim/release/libsynapse_core_ffi.a \
+              -headers target/xc-headers \
+            -output target/SynapseCore.xcframework
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: model
+          key: model-v1
+
+      - name: Download embedding model
+        run: |
+          set -euo pipefail
+          if [ -f model/model_optimized.onnx ]; then exit 0; fi
+          mkdir -p model
+          for f in model_optimized.onnx tokenizer.json config.json \
+                   special_tokens_map.json tokenizer_config.json; do
+            curl -sSfL "https://huggingface.co/$MODEL_REPO/resolve/main/$f" \
+              -o "model/$f"
+          done
+          ls -la model
+
+      - name: Build embed_smoke (host + simulator)
+        run: |
+          set -euo pipefail
+          cargo build -p synapse-core --release --bin embed_smoke
+          ORT_LIB_LOCATION="$PWD/ort-libs/sim" \
+          RUSTFLAGS="-C link-arg=-lc++ -C link-arg=-framework -C link-arg=Foundation -C link-arg=-framework -C link-arg=CoreML" \
+            cargo build -p synapse-core --release --bin embed_smoke \
+              --no-default-features --target aarch64-apple-ios-sim
+
+      - name: Embedding parity macOS vs iOS simulator
+        run: |
+          set -euo pipefail
+          ./target/release/embed_smoke "$PWD/model" > host.json
+          UDID=$(xcrun simctl list devices available --json \
+            | jq -r '[.devices[][] | select(.isAvailable and (.name | test("^iPhone")))][0].udid')
+          echo "simulator: $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl spawn "$UDID" \
+            "$PWD/target/aarch64-apple-ios-sim/release/embed_smoke" "$PWD/model" > ios.json
+          python3 scripts/ci/compare_vectors.py host.json ios.json
+
+      - name: Upload xcframework + Swift bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: SynapseCore-ios
+          path: |
+            target/SynapseCore.xcframework
+            target/swift
