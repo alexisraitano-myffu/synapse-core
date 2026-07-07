@@ -1,0 +1,69 @@
+# Windows build of the core: cargo tests (with the real model, so the
+# ort-download runtime path is exercised end-to-end) + the synapse_core wheel
+# as artifact. The app repo's Windows distribution workflow installs this
+# wheel into the PyInstaller backend bundle instead of building it locally.
+name: windows-core
+
+on:
+  push:
+    branches: [main, ci/ios]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODEL_REPO: qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q
+
+jobs:
+  test-and-wheel:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: model
+          key: model-v1
+          enableCrossOsArchive: true
+
+      - name: Download embedding model
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f model/model_optimized.onnx ]; then exit 0; fi
+          mkdir -p model
+          for f in model_optimized.onnx tokenizer.json config.json \
+                   special_tokens_map.json tokenizer_config.json; do
+            curl -sSfL "https://huggingface.co/$MODEL_REPO/resolve/main/$f" \
+              -o "model/$f"
+          done
+
+      - name: cargo test (default members, model-backed)
+        shell: bash
+        env:
+          SYNAPSE_MODEL_DIR: ${{ github.workspace }}/model
+        run: cargo test --release
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build synapse_core wheel
+        shell: bash
+        run: |
+          pip install maturin
+          maturin build --release -m crates/synapse-core-py/Cargo.toml
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: synapse-core-wheel-windows
+          path: target/wheels/*.whl
+          if-no-files-found: error
