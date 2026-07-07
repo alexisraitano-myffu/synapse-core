@@ -179,6 +179,24 @@ impl Storage {
             })
             .collect())
     }
+
+    // ── P2P sync (SYN-112/SYN-113): engine surface for the mobile transport ──
+
+    pub fn sync_device_id(&self) -> Result<String, CoreError> {
+        Ok(self.inner.sync_device_id()?)
+    }
+
+    /// Changeset (protocol-v1 JSON string) of everything journaled after
+    /// `since`; paginate with the returned `next` cursor while `has_more`.
+    pub fn sync_changes_since(&self, since: i64, limit: i64) -> Result<String, CoreError> {
+        Ok(self.inner.sync_changes_since(since, limit)?)
+    }
+
+    /// Merge a peer's changeset (per-column LWW) → JSON report. The caller
+    /// re-embeds the notes listed under `notes_changed`.
+    pub fn sync_apply(&self, changes_json: String) -> Result<String, CoreError> {
+        Ok(self.inner.sync_apply(&changes_json)?)
+    }
 }
 
 /// One SQLite value crossing the FFI boundary, in either direction.
