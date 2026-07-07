@@ -130,6 +130,15 @@ jobs:
             target/SynapseCore.xcframework
             target/swift
 
+      # abi3 macOS wheel: lets any macOS CI (the app repo's iOS E2E job runs
+      # the public backend on its runner) pip-install the core without a
+      # local build.
+      - name: Build macOS wheel
+        run: |
+          python3 -m pip install --quiet maturin
+          python3 -m maturin build --release -m crates/synapse-core-py/Cargo.toml
+          ls target/wheels
+
       # Rolling release consumed by the (private) app repo's iOS CI: a stable
       # public URL, refreshed on every green main build.
       - name: Publish rolling release (main only)
@@ -146,4 +155,5 @@ jobs:
             gh release edit core-ios --notes "$NOTES"
           gh release upload core-ios --clobber \
             target/SynapseCore.xcframework.zip \
-            target/SynapseCore-swift-bindings.zip
+            target/SynapseCore-swift-bindings.zip \
+            target/wheels/*.whl
