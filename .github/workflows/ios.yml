@@ -135,8 +135,10 @@ jobs:
       # local build.
       - name: Build macOS wheel
         run: |
-          python3 -m pip install --quiet maturin
-          python3 -m maturin build --release -m crates/synapse-core-py/Cargo.toml
+          # PEP 668: the runner's Homebrew Python refuses bare pip installs.
+          python3 -m venv /tmp/maturin-venv
+          /tmp/maturin-venv/bin/pip install --quiet maturin
+          /tmp/maturin-venv/bin/maturin build --release -m crates/synapse-core-py/Cargo.toml
           ls target/wheels
 
       # Rolling release consumed by the (private) app repo's iOS CI: a stable
