@@ -29,6 +29,8 @@ jobs:
   xcframework:
     runs-on: macos-15
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       ORT_IOS_XCFWK_PATH: ${{ github.workspace }}/ort-libs/onnxruntime.xcframework
     steps:
@@ -127,3 +129,21 @@ jobs:
           path: |
             target/SynapseCore.xcframework
             target/swift
+
+      # Rolling release consumed by the (private) app repo's iOS CI: a stable
+      # public URL, refreshed on every green main build.
+      - name: Publish rolling release (main only)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd target && zip -qry SynapseCore.xcframework.zip SynapseCore.xcframework)
+          (cd target/swift && zip -qy ../SynapseCore-swift-bindings.zip *)
+          NOTES="Build $(git rev-parse --short HEAD) — onnxruntime iOS $ORT_IOS_VERSION (l'app doit lier onnxruntime.xcframework du pod onnxruntime-c à côté)."
+          gh release create core-ios --title "SynapseCore iOS (rolling)" \
+            --notes "$NOTES" --latest=false 2>/dev/null || \
+            gh release edit core-ios --notes "$NOTES"
+          gh release upload core-ios --clobber \
+            target/SynapseCore.xcframework.zip \
+            target/SynapseCore-swift-bindings.zip
