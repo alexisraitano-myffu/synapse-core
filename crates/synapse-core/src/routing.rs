@@ -127,6 +127,18 @@ impl Brain {
         Some(vec.iter().flat_map(|x| x.to_le_bytes()).collect())
     }
 
+    /// Embed arbitrary text with the Brain's already-loaded embedder — the
+    /// host-side re-embed path after a sync apply (mirror of the backend's
+    /// `embed_text`), without paying a second model load.
+    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        match &self.embedder {
+            Some(e) => e.embed(text),
+            None => Err(CoreError::Embedding(
+                "brain opened without a model_dir".into(),
+            )),
+        }
+    }
+
     /// Port of `_process_entry` minus classification/resources/LLM calls.
     /// `entry` = `{id, content}`; `classified` = the classifier JSON.
     /// Marks the inbox row processed. The caller handles errors by marking

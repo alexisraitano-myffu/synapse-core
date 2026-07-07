@@ -315,6 +315,12 @@ impl Brain {
         Ok(synapse_core::Brain::report_to_json(&report).to_string())
     }
 
+    /// Embed with the Brain's already-loaded model (no second Embedder):
+    /// the re-embed path after a sync apply on mobile hosts.
+    pub fn embed(&self, text: String) -> Result<Vec<f32>, CoreError> {
+        Ok(self.inner.embed_text(&text)?)
+    }
+
     pub fn validate_pending(&self, new_facts_json: String) -> Result<i64, CoreError> {
         let new_facts: Vec<serde_json::Value> = serde_json::from_str(&new_facts_json)
             .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
