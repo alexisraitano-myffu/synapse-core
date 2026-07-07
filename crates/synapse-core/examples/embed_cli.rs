@@ -1,12 +1,14 @@
 //! On-device smoke/parity CLI: `embed_cli <model_dir> [text]`.
 //! Prints timing and the first components of the L2-normalized vector.
 //!
-//! Debug aid: a watchdog thread sends SIGUSR1 to the main thread if model
-//! loading takes more than 15s; the handler prints the main thread's
+//! Debug aid (unix only): a watchdog thread sends SIGUSR1 to the main thread
+//! if model loading takes more than 15s; the handler prints the main thread's
 //! backtrace (this is how the Android ort init hang was diagnosed).
 
+#[cfg(unix)]
 use std::os::raw::c_int;
 
+#[cfg(unix)]
 extern "C" fn dump_backtrace(_sig: c_int) {
     // Not async-signal-safe, but good enough for a diagnostic tool.
     eprintln!("=== main thread backtrace (watchdog) ===");
@@ -31,6 +33,7 @@ fn main() {
         .next()
         .unwrap_or_else(|| "bonjour le monde".to_string());
 
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGUSR1, dump_backtrace as usize);
         let main_thread = libc::pthread_self();
