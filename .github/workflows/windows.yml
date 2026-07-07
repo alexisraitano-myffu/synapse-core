@@ -6,7 +6,7 @@ name: windows-core
 
 on:
   push:
-    branches: [main, ci/ios]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

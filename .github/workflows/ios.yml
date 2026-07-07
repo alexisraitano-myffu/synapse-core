@@ -12,7 +12,7 @@ name: ios-core
 
 on:
   push:
-    branches: [ci/ios]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
