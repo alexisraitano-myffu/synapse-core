@@ -195,6 +195,17 @@ impl SqlConnection {
         crate::routing::persist_project_entry(&conn, canonical, content, capture_id, is_new_project)
     }
 
+    /// SYN-23 — the digest's structured week (pure SQL on THIS connection,
+    /// offline-testable). `now_sql` = optional fixed clock (tests).
+    pub fn gather_week(
+        &self,
+        now_sql: Option<&str>,
+        days: i64,
+    ) -> Result<serde_json::Value, CoreError> {
+        let conn = self.lock()?;
+        crate::digest::gather_week(&conn, crate::decay::resolve_now(now_sql), days)
+    }
+
     /// Full reactivation of every note mentioning one of `entity_names`.
     pub fn reactivate_notes_for_entities(
         &self,

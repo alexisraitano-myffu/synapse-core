@@ -355,6 +355,17 @@ impl SqlConnection {
             .map_err(core_err)
     }
 
+    /// SYN-23 — the digest's structured week as JSON (pure SQL on THIS
+    /// connection, offline). `now` = optional fixed clock 'YYYY-MM-DD HH:MM:SS'.
+    #[pyo3(signature = (now=None, days=7))]
+    fn gather_week(&self, py: Python<'_>, now: Option<String>, days: i64) -> PyResult<String> {
+        let conn = self.get()?;
+        let week = py
+            .detach(|| conn.gather_week(now.as_deref(), days))
+            .map_err(core_err)?;
+        Ok(week.to_string())
+    }
+
     /// Host-facing project-entry write on THIS connection (the caller's open
     /// transaction wraps it). Returns
     /// {project_id, entry_id, project_name, entry_content, entry_count};
@@ -678,6 +689,52 @@ impl Brain {
         .map_err(brain_err)
     }
 
+    /// SYN-23 — render the gathered week (JSON str) into the digest markdown
+    /// (prompt = data `digest.md`, LLM via the core HTTP path). Raises
+    /// ConnectionError on HTTP failure, ValueError on empty content.
+    #[pyo3(signature = (week_json, model, api_key, prompts_dir, today,
+                        base_url=None, fuel_token=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn summarize_digest(
+        &self,
+        py: Python<'_>,
+        week_json: &str,
+        model: &str,
+        api_key: &str,
+        prompts_dir: &str,
+        today: &str,
+        base_url: Option<&str>,
+        fuel_token: Option<&str>,
+    ) -> PyResult<String> {
+        let week: serde_json::Value = serde_json::from_str(week_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let config = synapse_core::LlmConfig {
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.map(String::from),
+            fuel_token: fuel_token.map(String::from),
+            prompts_dir: prompts_dir.to_string(),
+            today: today.to_string(),
+        };
+        py.detach(|| self.inner.summarize_digest(&week, &config))
+            .map_err(brain_err)
+    }
+
+    /// SYN-23 — store the digest note (idempotent per ISO week) + its vector,
+    /// on the Brain's OWN connection: call outside host transactions. Returns
+    /// the note id.
+    fn write_digest_note(
+        &self,
+        py: Python<'_>,
+        week_json: &str,
+        markdown: &str,
+    ) -> PyResult<String> {
+        let week: serde_json::Value = serde_json::from_str(week_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        py.detach(|| self.inner.write_digest_note(&week, markdown))
+            .map_err(brain_err)
+    }
+
     /// Alias-aware entity resolution → entity id or None.
     #[pyo3(signature = (canonical_name, aliases=None))]
     fn find_entity(
@@ -701,6 +758,13 @@ fn parse_classify_text(text: &str, content_len: usize, stop_reason: Option<&str>
         .map_err(brain_err)
 }
 
+/// SYN-23 — next concrete date of a (possibly recurring) event, ISO strings;
+/// None when `event_date` doesn't parse (Python returned None there too).
+#[pyfunction]
+fn next_occurrence(event_date: &str, recurring: bool, today: &str) -> Option<String> {
+    synapse_core::next_occurrence_str(event_date, recurring, today)
+}
+
 #[pymodule(name = "synapse_core")]
 fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Embedder>()?;
@@ -709,6 +773,7 @@ fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Brain>()?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(parse_classify_text, m)?)?;
+    m.add_function(wrap_pyfunction!(next_occurrence, m)?)?;
     m.add("EMBEDDING_DIM", synapse_core::EMBEDDING_DIM)?;
     Ok(())
 }

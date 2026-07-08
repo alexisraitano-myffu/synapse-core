@@ -12,6 +12,7 @@
 //!   their own SQL access for non-vector columns.
 
 mod decay;
+mod digest;
 mod embedder;
 mod llm;
 mod migrate;
@@ -22,6 +23,7 @@ mod storage;
 mod summaries;
 mod sync;
 
+pub use digest::next_occurrence_str;
 pub use embedder::{CoreError, Embedder, EMBEDDING_DIM};
 pub use llm::{parse_classify_text, LlmConfig};
 pub use routing::{Brain, ProjectSynthesis, RouteContext, RouteReport};

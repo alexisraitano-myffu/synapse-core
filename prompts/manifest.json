@@ -1,9 +1,10 @@
 {
-  "version": 2,
+  "version": 3,
   "files": {
     "classifier": "classifier.md",
     "resummary": "resummary.md",
     "project_summary": "project-summary.md",
-    "project_refinement": "project-refinement.md"
+    "project_refinement": "project-refinement.md",
+    "digest": "digest.md"
   }
 }
