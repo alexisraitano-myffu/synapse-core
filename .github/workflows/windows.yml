@@ -20,6 +20,8 @@ jobs:
   test-and-wheel:
     runs-on: windows-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -67,3 +69,18 @@ jobs:
           name: synapse-core-wheel-windows
           path: target/wheels/*.whl
           if-no-files-found: error
+
+      # Rolling release consumed by the (private) app repo's Windows
+      # distribution workflow — same pattern as core-ios on ios.yml.
+      - name: Publish rolling release (main only)
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Wheel Windows synapse_core — build $(git rev-parse --short HEAD)"
+          gh release create core-windows --title "SynapseCore Windows (rolling)" \
+            --notes "$NOTES" --latest=false 2>/dev/null || \
+            gh release edit core-windows --notes "$NOTES"
+          gh release upload core-windows --clobber target/wheels/*.whl
