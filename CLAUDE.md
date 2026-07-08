@@ -1,6 +1,6 @@
 # synapse-core
 
-Le cerveau compilé unique de Synapse (embeddings, stockage, routing, decay), écrit une fois en Rust et consommé partout : backend FastAPI Mac via PyO3, apps mobiles via UniFFI. Une seule implémentation, zéro divergence de logique entre plateformes. Repo public (Apache-2.0) : ne jamais y mettre d'URL Linear, de secrets ni de données utilisateur.
+Le cerveau compilé unique de Synapse — **complet depuis T5 (SYN-114)** : embeddings, stockage (schéma SQLite + sqlite-vec), classification + routing, decay, resummary/synthèse projet, digest hebdo, ressources web, sync P2P — écrit une fois en Rust et consommé partout : backend FastAPI Mac via PyO3, apps mobiles via UniFFI. Une seule implémentation, zéro divergence de logique entre plateformes. Repo public (Apache-2.0) : ne jamais y mettre d'URL Linear, de secrets ni de données utilisateur.
 
 ## Commands
 
@@ -29,7 +29,9 @@ python tools/gen_reference_vectors.py > reference_vectors.json   # golden vector
 
 Workspace à 3 crates, avec une règle dure : **toute la logique vit dans `crates/synapse-core`, les bindings sont des wrappers sans cervelle** (conversion de types + mapping d'erreurs, rien d'autre). Si un binding a besoin d'un comportement, il se code dans le core.
 
-- `crates/synapse-core` : lib pure Rust. Un module par domaine (`embedder.rs` aujourd'hui ; stockage, routing, decay arriveront par tranches SYN-96). `lib.rs` reste un point d'entrée mince qui ré-exporte.
+- `crates/synapse-core` : lib pure Rust. Un module par domaine — `embedder.rs`, `storage.rs`/`schema.rs`/`migrate.rs` (T1), `sql.rs` (passerelle SQL des hôtes), `llm.rs` + `routing.rs` (T2, classif + routing), `sync.rs` (T3, HLC/LWW), `decay.rs`/`summaries.rs`/`digest.rs`/`resources.rs` (T5). `lib.rs` reste un point d'entrée mince qui ré-exporte.
+- **Règle transactionnelle** : ce qui doit s'exécuter dans la transaction du caller s'expose sur `SqlConnection` (insert_fact, decay, gather_week, add_project_entry) ; les passes LLM/vecteurs vivent sur `Brain` (sa propre connexion) et s'appellent hors transaction hôte — sinon SQLITE_BUSY.
+- **Prompts** : `prompts/*.md` + `manifest.json`, byte-identiques aux constantes Python historiques (`llm::load_prompt` strippe le `\n` final). Déployés côté hôtes dans `~/.synapse/prompts/` — les livrer avant/avec toute wheel qui les lit.
 - `crates/synapse-core-py` : PyO3, module Python `synapse_core` (le crate/fn s'appelle `synapse_core_py` pour éviter la collision de noms avec la dépendance). Exclu des `default-members` : build via **maturin uniquement** (link `-undefined dynamic_lookup`). Libérer le GIL (`py.detach`) autour de tout appel coûteux.
 - `crates/synapse-core-ffi` : UniFFI proc-macro (`uniffi::setup_scaffolding!`). Sorties générées dans `bindings/` (gitignoré, régénérable).
 - **Les fichiers modèle et les prompts sont de la donnée, jamais du code** : passés en chemin au runtime, bundlés en assets côté apps, jamais commités (App Store 2.5.2). Le comportement (ex. troncature) se lit depuis les fichiers modèle, pas de constantes en dur qui divergeraient de Python.
