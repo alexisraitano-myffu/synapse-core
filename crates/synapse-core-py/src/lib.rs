@@ -355,6 +355,33 @@ impl SqlConnection {
             .map_err(core_err)
     }
 
+    /// Host-facing project-entry write on THIS connection (the caller's open
+    /// transaction wraps it). Returns
+    /// {project_id, entry_id, project_name, entry_content, entry_count};
+    /// the LLM synthesis is Brain.synthesize_project, run after commit.
+    #[pyo3(signature = (canonical, content, capture_id, is_new_project=false))]
+    fn add_project_entry(
+        &self,
+        py: Python<'_>,
+        canonical: &str,
+        content: &str,
+        capture_id: &str,
+        is_new_project: bool,
+    ) -> PyResult<String> {
+        let conn = self.get()?;
+        let s = py
+            .detach(|| conn.add_project_entry(canonical, content, capture_id, is_new_project))
+            .map_err(core_err)?;
+        Ok(serde_json::json!({
+            "project_id": s.project_id,
+            "entry_id": s.entry_id,
+            "project_name": s.project_name,
+            "entry_content": s.entry_content,
+            "entry_count": s.entry_count,
+        })
+        .to_string())
+    }
+
     /// Close the underlying SQLite connection (further calls raise).
     fn close(&mut self) {
         self.inner = None;
@@ -503,6 +530,112 @@ impl Brain {
             .detach(|| self.inner.classify(content, day_context, &config))
             .map_err(brain_err)?;
         Ok(classified.to_string())
+    }
+
+    /// SYN-89 re-summary pass (T5): entities touched by the run + stale ones,
+    /// summaries rebuilt from active facts/relations via the LLM. Returns the
+    /// regenerated entity ids as a JSON array. HTTP failure stops the pass
+    /// silently (stale flags survive) — mirror of the Python `break`.
+    #[pyo3(signature = (touched_ids, model, api_key, prompts_dir, today,
+                        base_url=None, fuel_token=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn resummarize(
+        &self,
+        py: Python<'_>,
+        touched_ids: Vec<String>,
+        model: &str,
+        api_key: &str,
+        prompts_dir: &str,
+        today: &str,
+        base_url: Option<&str>,
+        fuel_token: Option<&str>,
+    ) -> PyResult<String> {
+        let config = synapse_core::LlmConfig {
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.map(String::from),
+            fuel_token: fuel_token.map(String::from),
+            prompts_dir: prompts_dir.to_string(),
+            today: today.to_string(),
+        };
+        let ids = py
+            .detach(|| self.inner.resummarize(&touched_ids, &config))
+            .map_err(brain_err)?;
+        Ok(serde_json::Value::from(ids).to_string())
+    }
+
+    /// SYN-43/44 living project synthesis (T5): append + threshold-triggered
+    /// refinement. Returns the new summary_md or None (failures never block).
+    #[pyo3(signature = (project_id, project_name, new_entry_content, new_entry_count,
+                        model, api_key, prompts_dir, today, base_url=None, fuel_token=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_project(
+        &self,
+        py: Python<'_>,
+        project_id: &str,
+        project_name: &str,
+        new_entry_content: &str,
+        new_entry_count: i64,
+        model: &str,
+        api_key: &str,
+        prompts_dir: &str,
+        today: &str,
+        base_url: Option<&str>,
+        fuel_token: Option<&str>,
+    ) -> PyResult<Option<String>> {
+        let config = synapse_core::LlmConfig {
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.map(String::from),
+            fuel_token: fuel_token.map(String::from),
+            prompts_dir: prompts_dir.to_string(),
+            today: today.to_string(),
+        };
+        py.detach(|| {
+            self.inner.synthesize_project(
+                project_id,
+                project_name,
+                new_entry_content,
+                new_entry_count,
+                &config,
+            )
+        })
+        .map_err(brain_err)
+    }
+
+    /// Host-facing project-entry write (manual API endpoints): find/create
+    /// the project, INSERT the entry. Returns
+    /// {project_id, entry_id, project_name, entry_content, entry_count}.
+    #[pyo3(signature = (canonical, content, capture_id, is_new_project=false))]
+    fn add_project_entry(
+        &self,
+        py: Python<'_>,
+        canonical: &str,
+        content: &str,
+        capture_id: &str,
+        is_new_project: bool,
+    ) -> PyResult<String> {
+        let s = py
+            .detach(|| {
+                self.inner
+                    .add_project_entry(canonical, content, capture_id, is_new_project)
+            })
+            .map_err(brain_err)?;
+        Ok(serde_json::json!({
+            "project_id": s.project_id,
+            "entry_id": s.entry_id,
+            "project_name": s.project_name,
+            "entry_content": s.entry_content,
+            "entry_count": s.entry_count,
+        })
+        .to_string())
+    }
+
+    /// Port of `step6_vectorize` (T5): embed each entity's composite text and
+    /// store the vector; per-entity failures skip. Returns the count.
+    fn vectorize_entities(&self, py: Python<'_>, entity_ids: Vec<String>) -> PyResult<i64> {
+        py.detach(|| self.inner.vectorize_entities(&entity_ids))
+            .map_err(brain_err)
     }
 
     /// Shared fact write (SYN-37 supersede + dedup) for the validation /

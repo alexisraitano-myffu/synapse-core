@@ -180,6 +180,21 @@ impl SqlConnection {
         crate::decay::reactivate_notes(&conn, note_ids, factor, crate::decay::resolve_now(now_sql))
     }
 
+    /// Host-facing project-entry write on THIS connection (the API endpoints
+    /// wrap it in their transaction). The LLM synthesis is a separate step
+    /// (`Brain::synthesize_project`), run after commit — the old Python code
+    /// held the SQLite transaction across the Haiku call.
+    pub fn add_project_entry(
+        &self,
+        canonical: &str,
+        content: &str,
+        capture_id: &str,
+        is_new_project: bool,
+    ) -> Result<crate::ProjectSynthesis, CoreError> {
+        let conn = self.lock()?;
+        crate::routing::persist_project_entry(&conn, canonical, content, capture_id, is_new_project)
+    }
+
     /// Full reactivation of every note mentioning one of `entity_names`.
     pub fn reactivate_notes_for_entities(
         &self,

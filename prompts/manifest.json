@@ -1,6 +1,9 @@
 {
-  "version": 1,
+  "version": 2,
   "files": {
-    "classifier": "classifier.md"
+    "classifier": "classifier.md",
+    "resummary": "resummary.md",
+    "project_summary": "project-summary.md",
+    "project_refinement": "project-refinement.md"
   }
 }

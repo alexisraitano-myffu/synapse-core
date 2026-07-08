@@ -77,6 +77,7 @@ pub struct RouteContext {
 #[derive(Debug, Clone)]
 pub struct ProjectSynthesis {
     pub project_id: String,
+    pub entry_id: String,
     pub project_name: String,
     pub entry_content: String,
     pub entry_count: i64,
@@ -122,7 +123,7 @@ impl Brain {
         Ok(Self { storage, embedder })
     }
 
-    fn embed(&self, text: &str) -> Option<Vec<u8>> {
+    pub(crate) fn embed(&self, text: &str) -> Option<Vec<u8>> {
         let vec = self.embedder.as_ref()?.embed(text).ok()?;
         Some(vec.iter().flat_map(|x| x.to_le_bytes()).collect())
     }
@@ -358,6 +359,7 @@ impl Brain {
             "fast_exit": report.fast_exit,
             "project_syntheses": report.project_syntheses.iter().map(|s| json!({
                 "project_id": s.project_id,
+                "entry_id": s.entry_id,
                 "project_name": s.project_name,
                 "entry_content": s.entry_content,
                 "entry_count": s.entry_count,
@@ -916,7 +918,7 @@ struct Resolved {
 
 // ── shared helpers (ports of the module-level Python functions) ─────────
 
-fn new_uuid() -> String {
+pub(crate) fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -1017,7 +1019,7 @@ pub(crate) fn compute_confidence(
 }
 
 /// Generic row → JSON map (blobs become Null — never consumed by routing).
-fn query_row_map(
+pub(crate) fn query_row_map(
     conn: &Connection,
     sql: &str,
     params: &[SqlV],
@@ -1046,7 +1048,7 @@ fn query_row_map(
     }
 }
 
-fn query_row_maps(
+pub(crate) fn query_row_maps(
     conn: &Connection,
     sql: &str,
     params: &[SqlV],
@@ -1468,7 +1470,7 @@ fn persist_atomic_note(
     Ok(note_id)
 }
 
-fn persist_project_entry(
+pub(crate) fn persist_project_entry(
     conn: &Connection,
     canonical: &str,
     content: &str,
@@ -1515,10 +1517,11 @@ fn persist_project_entry(
             id
         }
     };
+    let entry_id = new_uuid();
     conn.execute(
         "INSERT INTO project_entries (id, project_id, capture_id, content, kind) \
          VALUES (?1, ?2, ?3, ?4, 'note')",
-        params![new_uuid(), project_id, capture_id, content],
+        params![entry_id, project_id, capture_id, content],
     )?;
     let entry_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM project_entries WHERE project_id = ?1",
@@ -1527,6 +1530,7 @@ fn persist_project_entry(
     )?;
     Ok(ProjectSynthesis {
         project_id,
+        entry_id,
         project_name: canonical.to_string(),
         entry_content: content.to_string(),
         entry_count,

@@ -1,0 +1,402 @@
+//! T5 (SYN-114) — the LLM summary passes, ported from `dream_cycle/cycle.py`:
+//! entity re-summary (SYN-89) and the living project synthesis (SYN-43, with
+//! the SYN-44 "garbage collector" refinement). Prompts are DATA in
+//! `prompts_dir` (`resummary.md`, `project-summary.md`,
+//! `project-refinement.md`), byte-identical to the historical Python
+//! constants; the HTTP path is the classifier's (`llm::post_messages`).
+
+use rusqlite::types::Value as SqlV;
+use rusqlite::{params, Connection};
+use serde_json::{json, Value};
+
+use crate::embedder::CoreError;
+use crate::llm::{load_prompt, post_messages, response_text, LlmConfig};
+use crate::routing::{
+    entity_embedding_text, new_uuid, persist_project_entry, query_row_map, query_row_maps, Brain,
+    ProjectSynthesis,
+};
+
+/// Same two-step ``` fence strip as Python (drop the fence line, drop the tail).
+fn strip_fences(text: &str) -> String {
+    let t = text.trim();
+    if !t.starts_with("```") {
+        return t.to_string();
+    }
+    t.split_once('\n')
+        .map(|(_, rest)| rest)
+        .unwrap_or(t)
+        .rsplit_once("```")
+        .map(|(head, _)| head)
+        .unwrap_or(t)
+        .trim()
+        .to_string()
+}
+
+/// SYN-44 — new entries since the last refinement before a from-scratch pass.
+fn refinement_threshold() -> i64 {
+    std::env::var("SYNAPSE_REFINEMENT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(20)
+}
+
+/// Python `f"{value}"` on a JSON scalar out of the row map.
+fn scalar_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "None".to_string(),
+        other => other.to_string(),
+    }
+}
+
+impl Brain {
+    /// SYN-89 — regenerate entity summaries from scratch (derived, never
+    /// edited). Targets = `touched_ids` + entities flagged `summary_stale`.
+    /// Rebuilt from ACTIVE facts + non-pending relations only. Returns the
+    /// regenerated ids (to re-vectorize). An HTTP failure stops the pass —
+    /// the stale flags survive for the next run; a per-entity content
+    /// problem only skips that entity.
+    pub fn resummarize(
+        &self,
+        touched_ids: &[String],
+        config: &LlmConfig,
+    ) -> Result<Vec<String>, CoreError> {
+        let system = load_prompt(&config.prompts_dir, "resummary.md")?;
+        let conn = self.storage.lock()?;
+        let stale: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM entities WHERE summary_stale = 1 AND merged_into_id IS NULL",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut targets: Vec<String> = Vec::new();
+        for id in touched_ids.iter().chain(stale.iter()) {
+            if !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        }
+
+        let mut regenerated: Vec<String> = Vec::new();
+        for eid in &targets {
+            let e = query_row_map(
+                &conn,
+                "SELECT id, canonical_name, type FROM entities \
+                 WHERE id = ?1 AND merged_into_id IS NULL",
+                &[SqlV::Text(eid.clone())],
+            )?;
+            let Some(e) = e else { continue };
+            let facts = query_row_maps(
+                &conn,
+                "SELECT predicate, value FROM facts WHERE entity_id = ?1 \
+                 AND obsoleted_at IS NULL AND archived_at IS NULL \
+                 ORDER BY confidence DESC LIMIT 30",
+                &[SqlV::Text(eid.clone())],
+            )?;
+            let relations = query_row_maps(
+                &conn,
+                "SELECT r.predicate, x.canonical_name AS target FROM relations r \
+                 JOIN entities x ON x.id = r.entity_to \
+                 WHERE r.entity_from = ?1 AND r.review_status != 'pending'",
+                &[SqlV::Text(eid.clone())],
+            )?;
+            if facts.is_empty() && relations.is_empty() {
+                // Nothing to derive from — keep the extraction summary, clear the flag.
+                conn.execute(
+                    "UPDATE entities SET summary_stale = 0 WHERE id = ?1",
+                    params![eid],
+                )?;
+                continue;
+            }
+
+            let name = e.get("canonical_name").and_then(Value::as_str).unwrap_or("");
+            let etype = e.get("type").and_then(Value::as_str).unwrap_or("");
+            let mut lines = vec![format!(
+                "Entité : {name}{}",
+                if etype.is_empty() { String::new() } else { format!(" (type {etype})") }
+            )];
+            if !facts.is_empty() {
+                lines.push("Faits :".to_string());
+                for f in &facts {
+                    lines.push(format!(
+                        "- {} : {}",
+                        f.get("predicate").and_then(Value::as_str).unwrap_or(""),
+                        scalar_str(f.get("value").unwrap_or(&Value::Null)),
+                    ));
+                }
+            }
+            if !relations.is_empty() {
+                lines.push("Relations :".to_string());
+                for r in &relations {
+                    lines.push(format!(
+                        "- {} → {}",
+                        r.get("predicate").and_then(Value::as_str).unwrap_or(""),
+                        r.get("target").and_then(Value::as_str).unwrap_or(""),
+                    ));
+                }
+            }
+
+            let params_json = json!({
+                "model": config.model,
+                "max_tokens": 300,
+                "system": system,
+                "messages": [{"role": "user", "content": lines.join("\n")}],
+            });
+            let body = match post_messages(config, &params_json) {
+                Ok(b) => b,
+                // Infra failure — stop here; the stale flags survive.
+                Err(CoreError::LlmHttp(_)) => break,
+                Err(_) => continue,
+            };
+            let summary = response_text(&body);
+            if !summary.is_empty() {
+                conn.execute(
+                    "UPDATE entities SET summary = ?1, summary_stale = 0 WHERE id = ?2",
+                    params![summary, eid],
+                )?;
+                regenerated.push(eid.clone());
+            }
+        }
+        Ok(regenerated)
+    }
+
+    /// SYN-43 — amend (or create) a project's live synthesis after a new
+    /// entry, then trigger the SYN-44 from-scratch refinement once enough
+    /// entries accumulated. Failures never block the cycle (the entry is
+    /// already persisted; the synthesis catches up on the next one).
+    pub fn synthesize_project(
+        &self,
+        project_id: &str,
+        project_name: &str,
+        new_entry_content: &str,
+        new_entry_count: i64,
+        config: &LlmConfig,
+    ) -> Result<Option<String>, CoreError> {
+        let conn = self.storage.lock()?;
+        append_project_summary(
+            &conn,
+            config,
+            project_id,
+            project_name,
+            new_entry_content,
+            new_entry_count,
+        )
+    }
+
+    /// Host-facing project-entry write (the manual API endpoints): find or
+    /// create the project entity, INSERT the entry, return the synthesis
+    /// work item (the host decides whether to run the LLM synthesis).
+    pub fn add_project_entry(
+        &self,
+        canonical: &str,
+        content: &str,
+        capture_id: &str,
+        is_new_project: bool,
+    ) -> Result<ProjectSynthesis, CoreError> {
+        let conn = self.storage.lock()?;
+        persist_project_entry(&conn, canonical, content, capture_id, is_new_project)
+    }
+
+    /// Port of `step6_vectorize` — embed each entity's composite text and
+    /// store the vector. Per-entity failures skip (like Python); returns the
+    /// count embedded. No-op without an embedder.
+    pub fn vectorize_entities(&self, entity_ids: &[String]) -> Result<i64, CoreError> {
+        let mut vectorized = 0i64;
+        for eid in entity_ids {
+            let entity = {
+                let conn = self.storage.lock()?;
+                query_row_map(
+                    &conn,
+                    "SELECT * FROM entities WHERE id = ?1",
+                    &[SqlV::Text(eid.clone())],
+                )?
+            };
+            let Some(entity) = entity else { continue };
+            let Some(vec) = self.embed(&entity_embedding_text(&entity)) else {
+                continue;
+            };
+            if self.storage.set_entity_embedding(eid, &vec).is_ok() {
+                vectorized += 1;
+            }
+        }
+        Ok(vectorized)
+    }
+}
+
+/// Port of `_append_project_summary`. Any LLM failure → `Ok(None)` (the
+/// caller keeps going; Python swallowed every exception here).
+fn append_project_summary(
+    conn: &Connection,
+    config: &LlmConfig,
+    project_id: &str,
+    project_name: &str,
+    new_entry_content: &str,
+    new_entry_count: i64,
+) -> Result<Option<String>, CoreError> {
+    let system = load_prompt(&config.prompts_dir, "project-summary.md")?;
+    let current = query_row_map(
+        conn,
+        "SELECT psv.summary_md FROM project_state ps \
+         JOIN project_state_versions psv ON psv.id = ps.current_version_id \
+         WHERE ps.project_id = ?1",
+        &[SqlV::Text(project_id.to_string())],
+    )?;
+    let current_summary = current
+        .as_ref()
+        .and_then(|c| c.get("summary_md"))
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    let user_msg = match &current_summary {
+        Some(cur) => format!(
+            "Projet : {project_name}\n\nSynthèse actuelle :\n---\n{cur}\n---\n\n\
+             Nouvelle entrée à intégrer :\n---\n{new_entry_content}\n---\n\n\
+             Mets à jour la synthèse pour intégrer la nouvelle entrée."
+        ),
+        None => format!(
+            "Projet : {project_name}\n\nPremière entrée :\n---\n{new_entry_content}\n---\n\n\
+             Écris la synthèse initiale du projet à partir de cette entrée."
+        ),
+    };
+
+    let params_json = json!({
+        "model": config.model,
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": user_msg}],
+    });
+    let Ok(body) = post_messages(config, &params_json) else {
+        return Ok(None);
+    };
+    let summary_md = strip_fences(&response_text(&body));
+
+    let version_id = new_uuid();
+    conn.execute(
+        "INSERT INTO project_state_versions \
+         (id, project_id, summary_md, entry_count, trigger, kind) \
+         VALUES (?1,?2,?3,?4,'passive','append')",
+        params![version_id, project_id, summary_md, new_entry_count],
+    )?;
+    let has_state: Option<String> = {
+        let mut stmt = conn.prepare("SELECT project_id FROM project_state WHERE project_id = ?1")?;
+        let mut rows = stmt.query(params![project_id])?;
+        match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        }
+    };
+    if has_state.is_some() {
+        conn.execute(
+            "UPDATE project_state SET current_version_id=?1, updated_at=CURRENT_TIMESTAMP, \
+             entry_count_at_sync=?2 WHERE project_id=?3",
+            params![version_id, new_entry_count, project_id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO project_state \
+             (project_id, current_version_id, entry_count_at_sync) VALUES (?1,?2,?3)",
+            params![project_id, version_id, new_entry_count],
+        )?;
+    }
+
+    // SYN-44: from-scratch refinement once enough new entries accumulated.
+    let last_count: i64 = conn
+        .query_row(
+            "SELECT MAX(entry_count) FROM project_state_versions \
+             WHERE project_id = ?1 AND kind = 'refinement'",
+            params![project_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?
+        .unwrap_or(0);
+    if new_entry_count - last_count >= refinement_threshold() {
+        refine_project_summary(conn, config, project_id, project_name)?;
+    }
+
+    Ok(Some(summary_md))
+}
+
+/// Port of `_refine_project_summary` — rebuild the synthesis from-scratch
+/// from every entry (SYN-44 "garbage collector"). LLM failure → `Ok(None)`.
+fn refine_project_summary(
+    conn: &Connection,
+    config: &LlmConfig,
+    project_id: &str,
+    project_name: &str,
+) -> Result<Option<String>, CoreError> {
+    let system = load_prompt(&config.prompts_dir, "project-refinement.md")?;
+    let entries = query_row_maps(
+        conn,
+        "SELECT content, created_at FROM project_entries \
+         WHERE project_id = ?1 ORDER BY created_at ASC LIMIT 200",
+        &[SqlV::Text(project_id.to_string())],
+    )?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let timeline = entries
+        .iter()
+        .map(|e| {
+            format!(
+                "[{}] {}",
+                scalar_str(e.get("created_at").unwrap_or(&Value::Null)),
+                e.get("content").and_then(Value::as_str).unwrap_or(""),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_msg = format!(
+        "Projet : {project_name}\n\n\
+         Toutes les entrées dans l'ordre chronologique :\n---\n{timeline}\n---\n\n\
+         Reconstruis from-scratch la synthèse du projet."
+    );
+
+    let params_json = json!({
+        "model": config.model,
+        "max_tokens": 2048,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": user_msg}],
+    });
+    let Ok(body) = post_messages(config, &params_json) else {
+        return Ok(None);
+    };
+    let summary_md = strip_fences(&response_text(&body));
+
+    let entry_count = entries.len() as i64;
+    let version_id = new_uuid();
+    conn.execute(
+        "INSERT INTO project_state_versions \
+         (id, project_id, summary_md, entry_count, trigger, kind) \
+         VALUES (?1,?2,?3,?4,'passive','refinement')",
+        params![version_id, project_id, summary_md, entry_count],
+    )?;
+    conn.execute(
+        "UPDATE project_state SET current_version_id=?1, updated_at=CURRENT_TIMESTAMP, \
+         entry_count_at_sync=?2 WHERE project_id=?3",
+        params![version_id, entry_count, project_id],
+    )?;
+    Ok(Some(summary_md))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fences_strip_like_python() {
+        assert_eq!(strip_fences("## titre\ncorps"), "## titre\ncorps");
+        assert_eq!(strip_fences("```markdown\n## titre\ncorps\n```"), "## titre\ncorps");
+        assert_eq!(strip_fences("```\nx\n```"), "x");
+    }
+
+    #[test]
+    fn threshold_floor_is_one() {
+        std::env::set_var("SYNAPSE_REFINEMENT_THRESHOLD", "0");
+        assert_eq!(refinement_threshold(), 1);
+        std::env::set_var("SYNAPSE_REFINEMENT_THRESHOLD", "garbage");
+        assert_eq!(refinement_threshold(), 20);
+        std::env::remove_var("SYNAPSE_REFINEMENT_THRESHOLD");
+        assert_eq!(refinement_threshold(), 20);
+    }
+}

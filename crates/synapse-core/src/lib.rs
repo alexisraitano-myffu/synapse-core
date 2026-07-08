@@ -19,6 +19,7 @@ mod routing;
 mod schema;
 mod sql;
 mod storage;
+mod summaries;
 mod sync;
 
 pub use embedder::{CoreError, Embedder, EMBEDDING_DIM};

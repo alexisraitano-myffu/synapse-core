@@ -95,39 +95,64 @@ impl Brain {
         config: &LlmConfig,
     ) -> Result<Value, CoreError> {
         let params = self.build_classify_params(content, day_context, config)?;
-        let base = config
-            .base_url
-            .as_deref()
-            .unwrap_or("https://api.anthropic.com")
-            .trim_end_matches('/');
-        let url = format!("{base}/v1/messages");
-
-        let mut request = ureq::post(&url)
-            .timeout(std::time::Duration::from_secs(600))
-            .set("content-type", "application/json")
-            .set("anthropic-version", ANTHROPIC_VERSION);
-        request = match &config.fuel_token {
-            Some(token) => request
-                .set("x-api-key", "placeholder-real-key-lives-on-the-proxy")
-                .set("x-synapse-token", token),
-            None => request.set("x-api-key", &config.api_key),
-        };
-
-        let response = request.send_string(&params.to_string()).map_err(|e| match e {
-            ureq::Error::Status(code, resp) => {
-                let body = resp.into_string().unwrap_or_default();
-                CoreError::LlmHttp(format!("HTTP {code}: {}", &body[..body.len().min(500)]))
-            }
-            other => CoreError::LlmHttp(other.to_string()),
-        })?;
-        let body: Value = response
-            .into_json()
-            .map_err(|e| CoreError::LlmHttp(format!("invalid response body: {e}")))?;
-
+        let body = post_messages(config, &params)?;
         let text = body["content"][0]["text"].as_str().unwrap_or("");
         let stop_reason = body["stop_reason"].as_str();
         parse_classify_text(text, content.chars().count(), stop_reason)
     }
+}
+
+/// POST /v1/messages with the config's key/fuel-proxy routing — the single
+/// HTTP path shared by classify and the T5 summary calls. Returns the parsed
+/// response body; HTTP/network failures are `LlmHttp` (abort-the-run policy).
+pub(crate) fn post_messages(config: &LlmConfig, params: &Value) -> Result<Value, CoreError> {
+    let base = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com")
+        .trim_end_matches('/');
+    let url = format!("{base}/v1/messages");
+
+    let mut request = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(600))
+        .set("content-type", "application/json")
+        .set("anthropic-version", ANTHROPIC_VERSION);
+    request = match &config.fuel_token {
+        Some(token) => request
+            .set("x-api-key", "placeholder-real-key-lives-on-the-proxy")
+            .set("x-synapse-token", token),
+        None => request.set("x-api-key", &config.api_key),
+    };
+
+    let response = request.send_string(&params.to_string()).map_err(|e| match e {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            CoreError::LlmHttp(format!("HTTP {code}: {}", &body[..body.len().min(500)]))
+        }
+        other => CoreError::LlmHttp(other.to_string()),
+    })?;
+    response
+        .into_json()
+        .map_err(|e| CoreError::LlmHttp(format!("invalid response body: {e}")))
+}
+
+/// `content[0].text` of a /v1/messages response, stripped — the plain-text
+/// consumers (summaries). Empty text is the caller's problem.
+pub(crate) fn response_text(body: &Value) -> String {
+    body["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Read a prompt file from `prompts_dir`, dropping the trailing newline so
+/// the text stays byte-identical to the historical Python constants.
+pub(crate) fn load_prompt(prompts_dir: &str, file: &str) -> Result<String, CoreError> {
+    let path = std::path::Path::new(prompts_dir).join(file);
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| CoreError::Storage(format!("cannot read {}: {e}", path.display())))?;
+    Ok(raw.strip_suffix('\n').unwrap_or(&raw).to_string())
 }
 
 /// Port of `_parse_classify_text` (max_tokens guard + fence strip + parse).
