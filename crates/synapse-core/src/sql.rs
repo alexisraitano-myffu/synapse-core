@@ -115,6 +115,37 @@ impl SqlConnection {
     pub fn last_insert_rowid(&self) -> Result<i64, CoreError> {
         Ok(self.lock()?.last_insert_rowid())
     }
+
+    /// Host-facing fact write on THIS connection — same dedup-reinforce +
+    /// SYN-37 supersede as the routing path (`routing::insert_fact`). Lives
+    /// on the gateway (not `Brain`) so the caller's open transaction
+    /// (savepoint-based `with conn:` on the Python side) wraps the write:
+    /// `Brain` runs on its own connection and would hit SQLITE_BUSY.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_fact(
+        &self,
+        entity_id: &str,
+        predicate: &str,
+        value: serde_json::Value,
+        confidence: f64,
+        source_inbox_id: serde_json::Value,
+        persistence_value: i64,
+        provenance_capture_id: Option<String>,
+        category: serde_json::Value,
+    ) -> Result<String, CoreError> {
+        let conn = self.lock()?;
+        crate::routing::insert_fact(
+            &conn,
+            entity_id,
+            predicate,
+            value,
+            confidence,
+            source_inbox_id,
+            persistence_value,
+            provenance_capture_id,
+            category,
+        )
+    }
 }
 
 fn run_stmt(

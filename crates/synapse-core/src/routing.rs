@@ -1241,8 +1241,11 @@ fn record_merge_proposal(
 }
 
 /// Port of `facts_store.insert_fact` (dedup-reinforce + SYN-37 supersede).
+/// pub(crate): the SQL gateway re-exposes it on the HOST's connection
+/// (`SqlConnection::insert_fact`) so user-action endpoints keep their open
+/// transaction (T5 — the Python copy is gone).
 #[allow(clippy::too_many_arguments)]
-fn insert_fact(
+pub(crate) fn insert_fact(
     conn: &Connection,
     entity_id: &str,
     predicate: &str,

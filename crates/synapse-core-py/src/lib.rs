@@ -258,6 +258,48 @@ impl SqlConnection {
         self.get()?.last_insert_rowid().map_err(core_err)
     }
 
+    /// Shared fact write (SYN-37 supersede + dedup) executed on THIS
+    /// connection, so the caller's open `with conn:` transaction wraps it
+    /// (the `Brain` variant runs on its own connection — SQLITE_BUSY inside
+    /// a host transaction). JSON scalars like `Brain.insert_fact`.
+    #[pyo3(signature = (entity_id, predicate, value_json, confidence,
+                        source_inbox_id_json="null", persistence_value=3,
+                        provenance_capture_id=None, category_json="null"))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_fact(
+        &self,
+        py: Python<'_>,
+        entity_id: &str,
+        predicate: &str,
+        value_json: &str,
+        confidence: f64,
+        source_inbox_id_json: &str,
+        persistence_value: i64,
+        provenance_capture_id: Option<String>,
+        category_json: &str,
+    ) -> PyResult<String> {
+        let value: serde_json::Value = serde_json::from_str(value_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let source: serde_json::Value = serde_json::from_str(source_inbox_id_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let category: serde_json::Value = serde_json::from_str(category_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let conn = self.get()?;
+        py.detach(|| {
+            conn.insert_fact(
+                entity_id,
+                predicate,
+                value,
+                confidence,
+                source,
+                persistence_value,
+                provenance_capture_id,
+                category,
+            )
+        })
+        .map_err(core_err)
+    }
+
     /// Close the underlying SQLite connection (further calls raise).
     fn close(&mut self) {
         self.inner = None;
