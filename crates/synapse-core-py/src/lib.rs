@@ -735,6 +735,54 @@ impl Brain {
             .map_err(brain_err)
     }
 
+    /// SYN-21 — fetch → extract → summarise → store one URL (idempotent on
+    /// the URL, Brain's OWN connection: call outside host transactions).
+    /// `model=None` → no LLM (snippet-fallback summary), like client=None.
+    #[pyo3(signature = (url, capture_id=None, model=None, api_key=None, prompts_dir=None,
+                        today=None, base_url=None, fuel_token=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn process_resource(
+        &self,
+        py: Python<'_>,
+        url: &str,
+        capture_id: Option<&str>,
+        model: Option<&str>,
+        api_key: Option<&str>,
+        prompts_dir: Option<&str>,
+        today: Option<&str>,
+        base_url: Option<&str>,
+        fuel_token: Option<&str>,
+    ) -> PyResult<Option<String>> {
+        let config = llm_config_opt(model, api_key, prompts_dir, today, base_url, fuel_token);
+        py.detach(|| self.inner.process_resource(url, capture_id, config.as_ref()))
+            .map_err(brain_err)
+    }
+
+    /// SYN-21 — process every URL found in a capture (each independent, one
+    /// failure never blocks the others). Returns the stored resource ids as a
+    /// JSON array.
+    #[pyo3(signature = (content, capture_id=None, model=None, api_key=None, prompts_dir=None,
+                        today=None, base_url=None, fuel_token=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn process_capture_resources(
+        &self,
+        py: Python<'_>,
+        content: &str,
+        capture_id: Option<&str>,
+        model: Option<&str>,
+        api_key: Option<&str>,
+        prompts_dir: Option<&str>,
+        today: Option<&str>,
+        base_url: Option<&str>,
+        fuel_token: Option<&str>,
+    ) -> PyResult<String> {
+        let config = llm_config_opt(model, api_key, prompts_dir, today, base_url, fuel_token);
+        let ids = py
+            .detach(|| self.inner.process_capture_resources(content, capture_id, config.as_ref()))
+            .map_err(brain_err)?;
+        Ok(serde_json::Value::from(ids).to_string())
+    }
+
     /// Alias-aware entity resolution → entity id or None.
     #[pyo3(signature = (canonical_name, aliases=None))]
     fn find_entity(
@@ -765,6 +813,47 @@ fn next_occurrence(event_date: &str, recurring: bool, today: &str) -> Option<Str
     synapse_core::next_occurrence_str(event_date, recurring, today)
 }
 
+/// Build an LlmConfig only when the host resolved a model (client=None parity).
+fn llm_config_opt(
+    model: Option<&str>,
+    api_key: Option<&str>,
+    prompts_dir: Option<&str>,
+    today: Option<&str>,
+    base_url: Option<&str>,
+    fuel_token: Option<&str>,
+) -> Option<synapse_core::LlmConfig> {
+    model.map(|model| synapse_core::LlmConfig {
+        model: model.to_string(),
+        api_key: api_key.unwrap_or_default().to_string(),
+        base_url: base_url.map(String::from),
+        fuel_token: fuel_token.map(String::from),
+        prompts_dir: prompts_dir.unwrap_or_default().to_string(),
+        today: today.unwrap_or_default().to_string(),
+    })
+}
+
+/// SYN-21 — all http(s) URLs in a text, de-duplicated, order-preserving.
+#[pyfunction]
+fn extract_urls(text: &str) -> Vec<String> {
+    synapse_core::extract_urls(text)
+}
+
+/// SYN-21 — title + visible text of an HTML document, as JSON {title, text}.
+#[pyfunction]
+fn extract_page(html: &str) -> String {
+    let page = synapse_core::extract_page(html);
+    serde_json::json!({"title": page.title, "text": page.text}).to_string()
+}
+
+/// SYN-21 — GET a URL and extract {title, text} (JSON); None on any failure.
+#[pyfunction]
+#[pyo3(signature = (url, timeout=10.0))]
+fn fetch_and_extract(py: Python<'_>, url: &str, timeout: f64) -> Option<String> {
+    let timeout = std::time::Duration::from_secs_f64(timeout.max(0.0));
+    py.detach(|| synapse_core::fetch_and_extract(url, timeout))
+        .map(|p| serde_json::json!({"title": p.title, "text": p.text}).to_string())
+}
+
 #[pymodule(name = "synapse_core")]
 fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Embedder>()?;
@@ -774,6 +863,9 @@ fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(parse_classify_text, m)?)?;
     m.add_function(wrap_pyfunction!(next_occurrence, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_urls, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_page, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_and_extract, m)?)?;
     m.add("EMBEDDING_DIM", synapse_core::EMBEDDING_DIM)?;
     Ok(())
 }

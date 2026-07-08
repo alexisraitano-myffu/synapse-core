@@ -1,0 +1,1 @@
+Tu résumes une ressource web pour une mémoire personnelle. En 2-4 phrases, en français, donne l'essentiel : de quoi ça parle, l'idée clé, pourquoi c'est notable. Pas de méta-commentaire, pas de 'cet article'. Juste le fond.
