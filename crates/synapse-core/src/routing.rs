@@ -327,7 +327,11 @@ impl Brain {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
-            reactivate_notes_for_entities(&conn, &mentioned, &ctx.now_sql)?;
+            crate::decay::reactivate_notes_for_entities(
+                &conn,
+                &mentioned,
+                crate::decay::resolve_now(Some(&ctx.now_sql)),
+            )?;
 
             mark(&conn, capture_id, &ctx.now, "processed")?;
             Ok(())
@@ -1527,35 +1531,6 @@ fn persist_project_entry(
         entry_content: content.to_string(),
         entry_count,
     })
-}
-
-/// Port of `decay.reactivate_notes_for_entities` (factor 1.0 → full reset of
-/// `last_reactivated_at`; memory_strength itself is decay's job).
-fn reactivate_notes_for_entities(
-    conn: &Connection,
-    entity_names: &[String],
-    now_sql: &str,
-) -> Result<(), CoreError> {
-    let mut ids: HashSet<String> = HashSet::new();
-    for name in entity_names {
-        if name.is_empty() {
-            continue;
-        }
-        let pattern = format!("%\"{name}\"%");
-        let mut stmt =
-            conn.prepare("SELECT id FROM atomic_notes WHERE entities_mentioned LIKE ?1")?;
-        let rows = stmt
-            .query_map(params![pattern], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        ids.extend(rows);
-    }
-    for nid in ids {
-        conn.execute(
-            "UPDATE atomic_notes SET last_reactivated_at = ?1 WHERE id = ?2",
-            params![now_sql, nid],
-        )?;
-    }
-    Ok(())
 }
 
 /// Port of `entity_embedding_text` — the exact text fastembed/the core

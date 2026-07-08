@@ -146,6 +146,53 @@ impl SqlConnection {
             category,
         )
     }
+
+    /// SYN-19 decay pass over atomic_notes (see `decay.rs`). `now_sql` =
+    /// optional fixed clock 'YYYY-MM-DD HH:MM:SS' (tests); None = system now.
+    pub fn apply_decay(
+        &self,
+        tau_days: Option<f64>,
+        now_sql: Option<&str>,
+    ) -> Result<i64, CoreError> {
+        let conn = self.lock()?;
+        crate::decay::apply_decay(&conn, tau_days, crate::decay::resolve_now(now_sql))
+    }
+
+    /// SYN-68 decay pass over entities (anchor `last_mentioned`).
+    pub fn apply_entity_decay(
+        &self,
+        tau_days: Option<f64>,
+        now_sql: Option<&str>,
+    ) -> Result<i64, CoreError> {
+        let conn = self.lock()?;
+        crate::decay::apply_entity_decay(&conn, tau_days, crate::decay::resolve_now(now_sql))
+    }
+
+    /// Move notes' reactivation anchor toward now (1.0 = full mention reset,
+    /// <1 = light search bump).
+    pub fn reactivate_notes(
+        &self,
+        note_ids: &[String],
+        factor: f64,
+        now_sql: Option<&str>,
+    ) -> Result<i64, CoreError> {
+        let conn = self.lock()?;
+        crate::decay::reactivate_notes(&conn, note_ids, factor, crate::decay::resolve_now(now_sql))
+    }
+
+    /// Full reactivation of every note mentioning one of `entity_names`.
+    pub fn reactivate_notes_for_entities(
+        &self,
+        entity_names: &[String],
+        now_sql: Option<&str>,
+    ) -> Result<i64, CoreError> {
+        let conn = self.lock()?;
+        crate::decay::reactivate_notes_for_entities(
+            &conn,
+            entity_names,
+            crate::decay::resolve_now(now_sql),
+        )
+    }
 }
 
 fn run_stmt(

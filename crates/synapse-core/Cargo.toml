@@ -24,6 +24,8 @@ sqlite-vec = { workspace = true }
 uuid = { workspace = true }
 # Blocking HTTP for the classifier call; rustls so Android needs no OpenSSL.
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# Naive UTC timestamp math for decay (SYN-19) — no clock/tz features needed.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

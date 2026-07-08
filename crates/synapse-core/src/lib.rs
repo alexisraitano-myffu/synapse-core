@@ -11,6 +11,7 @@
 //!   statically linked sqlite-vec) and every vector read/write; hosts keep
 //!   their own SQL access for non-vector columns.
 
+mod decay;
 mod embedder;
 mod llm;
 mod migrate;

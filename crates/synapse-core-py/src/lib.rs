@@ -300,6 +300,61 @@ impl SqlConnection {
         .map_err(core_err)
     }
 
+    /// SYN-19 decay pass over atomic_notes; `now` = optional fixed clock
+    /// 'YYYY-MM-DD HH:MM:SS' (tests inject it), None = system now.
+    #[pyo3(signature = (tau_days=None, now=None))]
+    fn apply_decay(
+        &self,
+        py: Python<'_>,
+        tau_days: Option<f64>,
+        now: Option<String>,
+    ) -> PyResult<i64> {
+        let conn = self.get()?;
+        py.detach(|| conn.apply_decay(tau_days, now.as_deref()))
+            .map_err(core_err)
+    }
+
+    /// SYN-68 decay pass over entities (anchor `last_mentioned`).
+    #[pyo3(signature = (tau_days=None, now=None))]
+    fn apply_entity_decay(
+        &self,
+        py: Python<'_>,
+        tau_days: Option<f64>,
+        now: Option<String>,
+    ) -> PyResult<i64> {
+        let conn = self.get()?;
+        py.detach(|| conn.apply_entity_decay(tau_days, now.as_deref()))
+            .map_err(core_err)
+    }
+
+    /// Move notes' reactivation anchor toward now (1.0 = full mention reset,
+    /// <1 = light search bump). Returns the count touched.
+    #[pyo3(signature = (note_ids, factor=1.0, now=None))]
+    fn reactivate_notes(
+        &self,
+        py: Python<'_>,
+        note_ids: Vec<String>,
+        factor: f64,
+        now: Option<String>,
+    ) -> PyResult<i64> {
+        let conn = self.get()?;
+        py.detach(|| conn.reactivate_notes(&note_ids, factor, now.as_deref()))
+            .map_err(core_err)
+    }
+
+    /// Full reactivation of every note mentioning one of `entity_names`.
+    #[pyo3(signature = (entity_names, now=None))]
+    fn reactivate_notes_for_entities(
+        &self,
+        py: Python<'_>,
+        entity_names: Vec<String>,
+        now: Option<String>,
+    ) -> PyResult<i64> {
+        let conn = self.get()?;
+        py.detach(|| conn.reactivate_notes_for_entities(&entity_names, now.as_deref()))
+            .map_err(core_err)
+    }
+
     /// Close the underlying SQLite connection (further calls raise).
     fn close(&mut self) {
         self.inner = None;
