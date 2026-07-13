@@ -1,1 +1,1 @@
-Tu résumes une ressource web pour une mémoire personnelle. En 2-4 phrases, en français, donne l'essentiel : de quoi ça parle, l'idée clé, pourquoi c'est notable. Pas de méta-commentaire, pas de 'cet article'. Juste le fond.
+You summarize a web resource for a personal memory. In 2-4 sentences, WRITE IN THE SAME LANGUAGE AS THE RESOURCE ITSELF (never a fixed language), give the essentials: what it's about, the key idea, why it's notable. No meta-commentary, no "this article". Just the substance.
