@@ -257,6 +257,11 @@ impl Brain {
                     .get("summary")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                // SYN-119 — the classifier detects the capture language server-side.
+                let language = classified
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
                 let note_id = persist_atomic_note(
                     &conn,
                     atomic.trim(),
@@ -270,6 +275,7 @@ impl Brain {
                         .filter(|s| !s.is_empty()),
                     truthy(classified.get("event_recurring")),
                     review_status,
+                    language,
                 )?;
                 created_note_id = Some(note_id.clone());
                 let title: String = if summary.is_empty() { atomic.trim() } else { summary }
@@ -1435,6 +1441,7 @@ fn persist_atomic_note(
     event_date: Option<&str>,
     event_recurring: bool,
     review_status: &str,
+    language: Option<&str>,
 ) -> Result<String, CoreError> {
     let kind = if ["note", "task", "event"].contains(&kind) { kind } else { "note" };
     let review_status = if ["confirmed", "pending"].contains(&review_status) {
@@ -1451,8 +1458,8 @@ fn persist_atomic_note(
     conn.execute(
         "INSERT INTO atomic_notes \
          (id, title, content, summary, entities_mentioned, memory_strength, \
-          provenance_capture_id, kind, event_date, event_recurring, review_status) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+          provenance_capture_id, kind, event_date, event_recurring, review_status, language) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             note_id,
             title,
@@ -1465,6 +1472,7 @@ fn persist_atomic_note(
             if durable { event_date } else { None },
             (durable && event_recurring) as i64,
             review_status,
+            language,
         ],
     )?;
     Ok(note_id)
@@ -1721,5 +1729,52 @@ mod tests {
         assert!(!truthy(Some(&json!(null))));
         assert!(truthy(Some(&json!([1]))));
         assert!(truthy(Some(&json!(false))) == false);
+    }
+
+    // SYN-119 — the language the classifier detected must flow end-to-end:
+    // route_capture reads `classified["language"]` and persists it on the note.
+    // A note-only capture needs neither the embedder nor the network.
+    #[test]
+    fn route_capture_persists_note_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let brain = Brain::open(db.to_str().unwrap(), None).unwrap();
+        {
+            let conn = brain.storage.lock().unwrap();
+            conn.execute(
+                "INSERT INTO inbox (id, content) VALUES ('c1', ?1)",
+                params!["Je me demande si je devrais arrêter le café"],
+            )
+            .unwrap();
+        }
+        let entry = json!({"id": "c1", "content": "Je me demande si je devrais arrêter le café"});
+        let classified = json!({
+            "language": "fr",
+            "input_type": "episodic",
+            "atomic_note": "Je me demande si je devrais arrêter le café",
+            "atomic_note_kind": "note",
+            "is_ephemeral": false,
+            "summary": "réflexion sur le café",
+            "entities": [],
+            "relations": [],
+            "project_entries": [],
+            "classification_confidence": 1.0
+        });
+        let ctx = RouteContext {
+            now: "2026-07-13T12:00:00".into(),
+            today: "2026-07-13".into(),
+            intentions_cutoff: "2026-07-11T12:00:00".into(),
+            now_sql: "2026-07-13 12:00:00".into(),
+        };
+        brain.route_capture(&entry, &classified, &ctx).unwrap();
+        let conn = brain.storage.lock().unwrap();
+        let lang: Option<String> = conn
+            .query_row(
+                "SELECT language FROM atomic_notes WHERE provenance_capture_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lang.as_deref(), Some("fr"));
     }
 }

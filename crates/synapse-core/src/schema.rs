@@ -288,6 +288,9 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE atomic_notes ADD COLUMN review_status TEXT NOT NULL DEFAULT 'confirmed'",
         // Relations join the same confidence gate.
         "ALTER TABLE relations ADD COLUMN review_status TEXT NOT NULL DEFAULT 'confirmed'",
+        // SYN-119 — capture language (ISO 639-1), nullable. Detected server-side by
+        // the classifier; drives content-language entity summaries + weekly digest.
+        "ALTER TABLE atomic_notes ADD COLUMN language TEXT",
     ];
 
     for ddl in alters {

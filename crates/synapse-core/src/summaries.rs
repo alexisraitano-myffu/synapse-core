@@ -16,6 +16,30 @@ use crate::routing::{
     ProjectSynthesis,
 };
 
+/// SYN-119 — majority language (ISO 639-1) across the atomic_notes that mention this
+/// entity, or None when no mentioning note carries a detected language. `entities_mentioned`
+/// is a JSON array of canonical names; we match the quoted name (LIKE wildcards escaped).
+/// This is the deterministic "content language" of an entity — facts/relations alone carry
+/// too little prose signal for the model to detect it reliably.
+fn dominant_note_language(conn: &Connection, canonical: &str) -> Result<Option<String>, CoreError> {
+    let escaped = canonical
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%\"{escaped}\"%");
+    let mut stmt = conn.prepare(
+        "SELECT language FROM atomic_notes \
+         WHERE language IS NOT NULL AND language != '' \
+           AND entities_mentioned LIKE ?1 ESCAPE '\\' \
+         GROUP BY language ORDER BY COUNT(*) DESC, language ASC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![pattern])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+        None => Ok(None),
+    }
+}
+
 /// Same two-step ``` fence strip as Python (drop the fence line, drop the tail).
 fn strip_fences(text: &str) -> String {
     let t = text.trim();
@@ -137,10 +161,25 @@ impl Brain {
                 }
             }
 
+            // SYN-119 — content-language summary. Prefer the deterministic majority
+            // language stored on the entity's source notes; fall back to letting the
+            // model infer from the material when no note carries a language (facts /
+            // relations are mostly interlingua, so inference alone is unreliable).
+            let lang_directive = match dominant_note_language(&conn, name)? {
+                Some(code) => format!(
+                    "write the summary in {code} (ISO 639-1) — the dominant language of this \
+                     entity's captures. Never translate to another language."
+                ),
+                None => "write the summary in the dominant language of the facts / relations \
+                     below (the entity's content language) — never a fixed language."
+                    .to_string(),
+            };
+            let system_e = system.replace("{language}", &lang_directive);
+
             let params_json = json!({
                 "model": config.model,
                 "max_tokens": 300,
-                "system": system,
+                "system": system_e,
                 "messages": [{"role": "user", "content": lines.join("\n")}],
             });
             let body = match post_messages(config, &params_json) {
@@ -398,5 +437,39 @@ mod tests {
         assert_eq!(refinement_threshold(), 20);
         std::env::remove_var("SYNAPSE_REFINEMENT_THRESHOLD");
         assert_eq!(refinement_threshold(), 20);
+    }
+
+    // SYN-119 — the entity's "content language" is the majority `language` of the
+    // atomic_notes that mention it (deterministic; injected into resummary.md). Also
+    // proves the atomic_notes.language column exists (the INSERT would fail otherwise).
+    #[test]
+    fn dominant_note_language_is_majority_vote() {
+        use crate::storage::Storage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synapse.db");
+        let storage = Storage::open(path.to_str().unwrap()).unwrap();
+        let conn = storage.lock().unwrap();
+        let mut ins = |mentioned: &str, lang: Option<&str>| {
+            conn.execute(
+                "INSERT INTO atomic_notes (id, content, entities_mentioned, language) \
+                 VALUES (?1, 'x', ?2, ?3)",
+                params![new_uuid(), mentioned, lang],
+            )
+            .unwrap();
+        };
+        ins(r#"["Marie","Paul"]"#, Some("fr"));
+        ins(r#"["Marie"]"#, Some("fr"));
+        ins(r#"["Marie"]"#, Some("en"));
+        ins(r#"["Paul"]"#, Some("en"));
+        ins(r#"["Solo"]"#, None); // no detected language
+
+        // Marie: 2×fr vs 1×en → fr.
+        assert_eq!(dominant_note_language(&conn, "Marie").unwrap().as_deref(), Some("fr"));
+        // Paul: 1×fr vs 1×en → tie broken deterministically by language ASC → en.
+        assert_eq!(dominant_note_language(&conn, "Paul").unwrap().as_deref(), Some("en"));
+        // Solo: mentioned only by a language-less note → None (fall back to inference).
+        assert_eq!(dominant_note_language(&conn, "Solo").unwrap(), None);
+        // Never mentioned → None.
+        assert_eq!(dominant_note_language(&conn, "Ghost").unwrap(), None);
     }
 }
