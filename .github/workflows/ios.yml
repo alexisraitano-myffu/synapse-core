@@ -13,6 +13,8 @@ name: ios-core
 on:
   push:
     branches: [main]
+    # Docs-only pushes to main must not burn a full iOS build.
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.gitignore']
   workflow_dispatch:
 
 concurrency:
