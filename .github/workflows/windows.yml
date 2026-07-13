@@ -7,6 +7,8 @@ name: windows-core
 on:
   push:
     branches: [main]
+    # Docs-only pushes to main must not burn a full Windows build.
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.gitignore']
   workflow_dispatch:
 
 concurrency:
