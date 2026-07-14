@@ -376,10 +376,13 @@ impl SqlConnection {
 
 /// Scanner-side result of accepting a QR offer: send `accept_pub` back to the
 /// offerer over the transport; keep `channel_key` to open the sealed payload.
+/// `offer_pub` (from the QR) rides along because `pairing_open` needs it as
+/// AAD — the joiner shouldn't have to re-parse the QR format (SYN-128).
 #[derive(uniffi::Record)]
 pub struct PairingAccept {
     pub accept_pub: Vec<u8>,
     pub channel_key: Vec<u8>,
+    pub offer_pub: Vec<u8>,
 }
 
 /// Pairing offerer session (SYN-128): the device that SHOWS the QR keeps this
@@ -426,6 +429,7 @@ pub fn pairing_accept(qr: String) -> Result<PairingAccept, CoreError> {
     Ok(PairingAccept {
         accept_pub: accept_pub.to_vec(),
         channel_key: channel_key.to_vec(),
+        offer_pub: offer.offer_pub.to_vec(),
     })
 }
 
