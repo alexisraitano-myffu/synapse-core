@@ -289,6 +289,104 @@ impl SqlConnection {
     }
 }
 
+// ── Pairing channel (SYN-128): authenticated secret transfer at join time ──
+
+/// Scanner-side result of accepting a QR offer: send `accept_pub` back to the
+/// offerer over the transport; keep `channel_key` to open the sealed payload.
+#[derive(uniffi::Record)]
+pub struct PairingAccept {
+    pub accept_pub: Vec<u8>,
+    pub channel_key: Vec<u8>,
+}
+
+/// Pairing offerer session (SYN-128): the device that SHOWS the QR keeps this
+/// between showing the offer and receiving the scanner's returned key.
+#[derive(uniffi::Object)]
+pub struct PairingSession {
+    inner: synapse_core::PairingSession,
+    qr: String,
+}
+
+#[uniffi::export]
+impl PairingSession {
+    /// Start a pairing. `addrs` = how the joiner can reach us (LAN URLs).
+    /// Render `qr()` as a QR code.
+    #[uniffi::constructor]
+    pub fn offer(addrs: Vec<String>) -> Result<Arc<Self>, CoreError> {
+        let (inner, offer) = synapse_core::PairingSession::offer(addrs)?;
+        let qr = offer.encode();
+        Ok(Arc::new(Self { inner, qr }))
+    }
+
+    /// The offer string to render as a QR code.
+    pub fn qr(&self) -> String {
+        self.qr.clone()
+    }
+
+    /// The offerer's ephemeral public key (32 bytes), for AAD in seal.
+    pub fn offer_pub(&self) -> Vec<u8> {
+        self.inner.offer_public().to_vec()
+    }
+
+    /// Complete with the scanner's returned public key → channel key.
+    pub fn channel_key(&self, accept_pub: Vec<u8>) -> Result<Vec<u8>, CoreError> {
+        let ap = key32(&accept_pub, "accept_pub")?;
+        Ok(self.inner.channel_key(&ap).to_vec())
+    }
+}
+
+/// Scanner side (SYN-128): decode the QR and derive the channel key.
+#[uniffi::export]
+pub fn pairing_accept(qr: String) -> Result<PairingAccept, CoreError> {
+    let offer = synapse_core::PairingOffer::decode(&qr)?;
+    let (accept_pub, channel_key) = synapse_core::pairing_accept(&offer)?;
+    Ok(PairingAccept {
+        accept_pub: accept_pub.to_vec(),
+        channel_key: channel_key.to_vec(),
+    })
+}
+
+/// The reachability hints embedded in a QR offer (so a joiner knows where to
+/// call back) — decoded without completing the exchange.
+#[uniffi::export]
+pub fn pairing_offer_addrs(qr: String) -> Result<Vec<String>, CoreError> {
+    Ok(synapse_core::PairingOffer::decode(&qr)?.addrs)
+}
+
+/// AEAD-seal a payload under the channel key (SYN-128). Returns base64.
+#[uniffi::export]
+pub fn pairing_seal(
+    channel_key: Vec<u8>,
+    offer_pub: Vec<u8>,
+    accept_pub: Vec<u8>,
+    plaintext: Vec<u8>,
+) -> Result<String, CoreError> {
+    let ck = key32(&channel_key, "channel_key")?;
+    let op = key32(&offer_pub, "offer_pub")?;
+    let ap = key32(&accept_pub, "accept_pub")?;
+    Ok(synapse_core::pairing_seal(&ck, &op, &ap, &plaintext)?)
+}
+
+/// Open what `pairing_seal` produced (SYN-128) → the plaintext bytes.
+#[uniffi::export]
+pub fn pairing_open(
+    channel_key: Vec<u8>,
+    offer_pub: Vec<u8>,
+    accept_pub: Vec<u8>,
+    sealed_b64: String,
+) -> Result<Vec<u8>, CoreError> {
+    let ck = key32(&channel_key, "channel_key")?;
+    let op = key32(&offer_pub, "offer_pub")?;
+    let ap = key32(&accept_pub, "accept_pub")?;
+    Ok(synapse_core::pairing_open(&ck, &op, &ap, &sealed_b64)?)
+}
+
+fn key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CoreError> {
+    bytes.try_into().map_err(|_| CoreError::Storage {
+        msg: format!("pairing: {what} must be 32 bytes"),
+    })
+}
+
 /// The Dream Cycle brain (SYN-111): deterministic routing + classifier
 /// orchestration. JSON strings across the boundary, same shapes as PyO3.
 #[derive(uniffi::Object)]
@@ -333,6 +431,12 @@ impl Brain {
     /// the re-embed path after a sync apply on mobile hosts.
     pub fn embed(&self, text: String) -> Result<Vec<f32>, CoreError> {
         Ok(self.inner.embed_text(&text)?)
+    }
+
+    /// Chunked variant (SYN-118): one vector per ~128-token window, feeding
+    /// `Storage.upsert_note_vectors` so mobile re-embeds match the desktop.
+    pub fn embed_chunks(&self, text: String) -> Result<Vec<Vec<f32>>, CoreError> {
+        Ok(self.inner.embed_text_chunks(&text)?)
     }
 
     pub fn validate_pending(&self, new_facts_json: String) -> Result<i64, CoreError> {

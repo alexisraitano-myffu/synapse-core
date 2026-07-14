@@ -158,6 +158,18 @@ impl Brain {
         }
     }
 
+    /// Chunked variant (SYN-118) for the same re-embed path: one vector per
+    /// ~128-token window, so a mobile host stores the same per-chunk rows as
+    /// the desktop backend after a sync apply.
+    pub fn embed_text_chunks(&self, text: &str) -> Result<Vec<Vec<f32>>, CoreError> {
+        match &self.embedder {
+            Some(e) => e.embed_chunks(text),
+            None => Err(CoreError::Embedding(
+                "brain opened without a model_dir".into(),
+            )),
+        }
+    }
+
     /// Port of `_process_entry` minus classification/resources/LLM calls.
     /// `entry` = `{id, content}`; `classified` = the classifier JSON.
     /// Marks the inbox row processed. The caller handles errors by marking
