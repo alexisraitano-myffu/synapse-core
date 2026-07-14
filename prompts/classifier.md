@@ -147,14 +147,16 @@ project_entries rules:
   variant.
 - If no identifiable project → project_entries = [] (empty array).
 - Never emit two items for the same project_canonical in one capture — merge the content into one item.
-- project facts: when the capture states a DURABLE LITERAL datum about the project itself (a total, a
-  budget, a count, a measured metric, a chosen option: "the terrace will cost 3000 EUR", "I've done
-  40 climbing sessions at Arkose in total"), ALSO emit the project in `entities` (type "project",
+- project facts: when the capture states a DURABLE LITERAL datum about the project itself — a total,
+  a budget, a count, a measured metric, a chosen option, a LEVEL or MILESTONE reached ("the terrace
+  will cost 3000 EUR", "I've done 40 climbing sessions in total", "I did my first violet-grade
+  boulder" → fact best_grade: "violette") — ALSO emit the project in `entities` (type "project",
   which per the guard below requires its project_entries item — natural here, the capture IS about
   the project) and attach the datum as a fact on that entity (e.g. budget, total_sessions,
-  chosen_venue). The narrative still goes to project_entries.content; the fact carries only the
-  durable datum. The fact vs relation rule applies unchanged: if the datum names another emitted
-  entity, it is a relation, not a fact.
+  best_grade, chosen_venue). The narrative still goes to project_entries.content; the fact carries
+  only the durable datum. A datum that supersedes an old one (new best grade, revised budget) is
+  still emitted — the memory handles obsolescence. The fact vs relation rule applies unchanged: if
+  the datum names another emitted entity, it is a relation, not a fact.
 
 entity type rules:
 - Choose `type` STRICTLY from the ACTIVE ENTITY TYPES provided in context below (the list grows over
