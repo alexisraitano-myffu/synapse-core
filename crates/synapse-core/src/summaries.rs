@@ -263,6 +263,37 @@ impl Brain {
     }
 }
 
+/// SYN-134 — the project's ACTIVE facts (durable literal data: totals,
+/// budget, choices) as a prompt block for the living synthesis. None when
+/// the project carries no facts, so the historical prompt shape is
+/// untouched for every project that predates project facts.
+fn project_facts_block(conn: &Connection, project_id: &str) -> Result<Option<String>, CoreError> {
+    let facts = query_row_maps(
+        conn,
+        "SELECT predicate, value FROM facts WHERE entity_id = ?1 \
+         AND obsoleted_at IS NULL AND archived_at IS NULL \
+         ORDER BY created_at ASC, id ASC",
+        &[SqlV::Text(project_id.to_string())],
+    )?;
+    if facts.is_empty() {
+        return Ok(None);
+    }
+    let lines = facts
+        .iter()
+        .map(|f| {
+            format!(
+                "- {} : {}",
+                f.get("predicate").and_then(Value::as_str).unwrap_or(""),
+                scalar_str(f.get("value").unwrap_or(&Value::Null)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Some(format!(
+        "Faits actifs du projet (données durables à refléter fidèlement dans la synthèse) :\n{lines}"
+    )))
+}
+
 /// Port of `_append_project_summary`. Any LLM failure → `Ok(None)` (the
 /// caller keeps going; Python swallowed every exception here).
 fn append_project_summary(
@@ -287,14 +318,19 @@ fn append_project_summary(
         .and_then(Value::as_str)
         .map(String::from);
 
+    // SYN-134 — the project's active facts ride along so the living
+    // synthesis reflects the durable data, not just the entry timeline.
+    let facts_block = project_facts_block(conn, project_id)?
+        .map(|b| format!("\n\n{b}"))
+        .unwrap_or_default();
     let user_msg = match &current_summary {
         Some(cur) => format!(
             "Projet : {project_name}\n\nSynthèse actuelle :\n---\n{cur}\n---\n\n\
-             Nouvelle entrée à intégrer :\n---\n{new_entry_content}\n---\n\n\
+             Nouvelle entrée à intégrer :\n---\n{new_entry_content}\n---{facts_block}\n\n\
              Mets à jour la synthèse pour intégrer la nouvelle entrée."
         ),
         None => format!(
-            "Projet : {project_name}\n\nPremière entrée :\n---\n{new_entry_content}\n---\n\n\
+            "Projet : {project_name}\n\nPremière entrée :\n---\n{new_entry_content}\n---{facts_block}\n\n\
              Écris la synthèse initiale du projet à partir de cette entrée."
         ),
     };
@@ -385,9 +421,13 @@ fn refine_project_summary(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    // SYN-134 — same durable-facts block as the append pass.
+    let facts_block = project_facts_block(conn, project_id)?
+        .map(|b| format!("\n\n{b}"))
+        .unwrap_or_default();
     let user_msg = format!(
         "Projet : {project_name}\n\n\
-         Toutes les entrées dans l'ordre chronologique :\n---\n{timeline}\n---\n\n\
+         Toutes les entrées dans l'ordre chronologique :\n---\n{timeline}\n---{facts_block}\n\n\
          Reconstruis from-scratch la synthèse du projet."
     );
 
@@ -421,6 +461,31 @@ fn refine_project_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_facts_block_filters_and_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pf.db");
+        crate::Storage::open(path.to_str().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(
+            "INSERT INTO entities (id, type, canonical_name) VALUES ('p1', 'project', 'Terrasse');
+             INSERT INTO facts (id, entity_id, predicate, value) VALUES ('f1', 'p1', 'budget', '3000 EUR');
+             INSERT INTO facts (id, entity_id, predicate, value, obsoleted_at) VALUES ('f2', 'p1', 'budget', '2000 EUR', CURRENT_TIMESTAMP);
+             INSERT INTO facts (id, entity_id, predicate, value, archived_at) VALUES ('f3', 'p1', 'surface', '12 m2', CURRENT_TIMESTAMP);",
+        )
+        .unwrap();
+
+        let block = project_facts_block(&conn, "p1").unwrap().unwrap();
+        assert!(block.starts_with("Faits actifs du projet"));
+        assert!(block.contains("- budget : 3000 EUR"));
+        assert!(!block.contains("2000 EUR")); // obsoleted filtered
+        assert!(!block.contains("12 m2")); // archived filtered
+
+        // A project without facts keeps the historical prompt shape.
+        assert!(project_facts_block(&conn, "p-none").unwrap().is_none());
+    }
 
     #[test]
     fn fences_strip_like_python() {
