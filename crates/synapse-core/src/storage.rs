@@ -127,6 +127,25 @@ impl Storage {
         crate::sync::apply_changes(&conn, changes_json)
     }
 
+    /// SYN-133 — post-pull safety net: collapse derived twins (same capture
+    /// routed by two devices during a no-sync window) onto the smallest uuid,
+    /// then sweep the doomed notes' vec0 rows (chunked keys included). The
+    /// deletions journal as tombstones → the collapse replicates. Run it
+    /// after every pull, on every host. Returns a JSON report
+    /// `{"removed": {table: n}, "doomed_notes": [...]}`.
+    pub fn dedup_after_pull(&self) -> Result<String, CoreError> {
+        let (removed, doomed_notes) = {
+            let conn = self.lock()?;
+            crate::sync::dedup_after_pull(&conn)?
+        };
+        // Vector sweep outside the row transaction (and after the guard drops
+        // — delete_note_vector re-locks this connection).
+        for nid in &doomed_notes {
+            let _ = self.delete_note_vector(nid);
+        }
+        Ok(serde_json::json!({"removed": removed, "doomed_notes": doomed_notes}).to_string())
+    }
+
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, CoreError> {
         self.conn
             .lock()

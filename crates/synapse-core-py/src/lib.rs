@@ -210,6 +210,12 @@ impl Storage {
             .map_err(core_err)
     }
 
+    /// SYN-133 — post-pull twin dedup (collapse on the smallest uuid,
+    /// tombstones journaled, doomed notes' vectors swept) → JSON report.
+    fn dedup_after_pull(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| self.inner.dedup_after_pull()).map_err(core_err)
+    }
+
     /// → [(id, title, url, summary, score)], score-descending.
     #[pyo3(signature = (query, limit=10))]
     fn search_resources(

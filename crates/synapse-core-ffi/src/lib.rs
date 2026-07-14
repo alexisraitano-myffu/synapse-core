@@ -211,6 +211,12 @@ impl Storage {
     pub fn sync_apply(&self, changes_json: String) -> Result<String, CoreError> {
         Ok(self.inner.sync_apply(&changes_json)?)
     }
+
+    /// SYN-133 — post-pull twin dedup (collapse on the smallest uuid,
+    /// tombstones journaled, doomed notes' vectors swept) → JSON report.
+    pub fn dedup_after_pull(&self) -> Result<String, CoreError> {
+        Ok(self.inner.dedup_after_pull()?)
+    }
 }
 
 /// One SQLite value crossing the FFI boundary, in either direction.
