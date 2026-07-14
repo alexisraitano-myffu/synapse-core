@@ -255,6 +255,31 @@ pub struct SqlResult {
     pub rows: Vec<Vec<SqlValue>>,
 }
 
+/// LLM call settings shared by the cycle passes (mirror of the core's
+/// LlmConfig; a fuel token routes through the proxy instead of a raw key).
+#[derive(uniffi::Record)]
+pub struct LlmSettings {
+    pub model: String,
+    pub api_key: String,
+    pub prompts_dir: String,
+    pub today: String,
+    pub base_url: Option<String>,
+    pub fuel_token: Option<String>,
+}
+
+impl From<LlmSettings> for synapse_core::LlmConfig {
+    fn from(s: LlmSettings) -> Self {
+        synapse_core::LlmConfig {
+            model: s.model,
+            api_key: s.api_key,
+            base_url: s.base_url,
+            fuel_token: s.fuel_token,
+            prompts_dir: s.prompts_dir,
+            today: s.today,
+        }
+    }
+}
+
 /// Generic SQL access to the core-owned database — the ONLY SQLite in the
 /// process (mixing two SQLite libraries on one file corrupts it).
 #[derive(uniffi::Object)]
@@ -286,6 +311,52 @@ impl SqlConnection {
 
     pub fn last_insert_rowid(&self) -> Result<i64, CoreError> {
         Ok(self.inner.last_insert_rowid()?)
+    }
+
+    // ── Full-cycle passes (SYN-130): the mobile host runs the same Dream
+    // Cycle as the desktop backend, so the T5 surface crosses the FFI too. ──
+
+    /// SYN-19 decay pass over atomic_notes; `now` = optional fixed clock
+    /// 'YYYY-MM-DD HH:MM:SS' (tests inject it), None = system now.
+    pub fn apply_decay(&self, tau_days: Option<f64>, now: Option<String>) -> Result<i64, CoreError> {
+        Ok(self.inner.apply_decay(tau_days, now.as_deref())?)
+    }
+
+    /// SYN-68 decay pass over entities (anchor `last_mentioned`).
+    pub fn apply_entity_decay(
+        &self,
+        tau_days: Option<f64>,
+        now: Option<String>,
+    ) -> Result<i64, CoreError> {
+        Ok(self.inner.apply_entity_decay(tau_days, now.as_deref())?)
+    }
+
+    /// Move notes' reactivation anchor toward now (1.0 = full mention reset,
+    /// <1 = light search bump). Returns the count touched.
+    pub fn reactivate_notes(
+        &self,
+        note_ids: Vec<String>,
+        factor: f64,
+        now: Option<String>,
+    ) -> Result<i64, CoreError> {
+        Ok(self.inner.reactivate_notes(&note_ids, factor, now.as_deref())?)
+    }
+
+    /// Full reactivation of every note mentioning one of `entity_names`.
+    pub fn reactivate_notes_for_entities(
+        &self,
+        entity_names: Vec<String>,
+        now: Option<String>,
+    ) -> Result<i64, CoreError> {
+        Ok(self
+            .inner
+            .reactivate_notes_for_entities(&entity_names, now.as_deref())?)
+    }
+
+    /// SYN-23 — the digest's structured week as JSON (pure SQL on THIS
+    /// connection, offline). `now` = optional fixed clock 'YYYY-MM-DD HH:MM:SS'.
+    pub fn gather_week(&self, now: Option<String>, days: i64) -> Result<String, CoreError> {
+        Ok(self.inner.gather_week(now.as_deref(), days)?.to_string())
     }
 }
 
@@ -437,6 +508,87 @@ impl Brain {
     /// `Storage.upsert_note_vectors` so mobile re-embeds match the desktop.
     pub fn embed_chunks(&self, text: String) -> Result<Vec<Vec<f32>>, CoreError> {
         Ok(self.inner.embed_text_chunks(&text)?)
+    }
+
+    // ── Full-cycle passes (SYN-130): total parity with the desktop host. ──
+
+    /// SYN-89 re-summary pass (T5): entities touched by the run + stale ones,
+    /// summaries rebuilt from active facts/relations via the LLM. Returns the
+    /// regenerated entity ids as a JSON array. An HTTP failure stops the pass
+    /// silently (stale flags survive).
+    pub fn resummarize(
+        &self,
+        touched_ids: Vec<String>,
+        config: LlmSettings,
+    ) -> Result<String, CoreError> {
+        let ids = self.inner.resummarize(&touched_ids, &config.into())?;
+        Ok(serde_json::Value::from(ids).to_string())
+    }
+
+    /// SYN-43/44 living project synthesis (T5): append + threshold-triggered
+    /// refinement. Returns the new summary_md or None (failures never block).
+    pub fn synthesize_project(
+        &self,
+        project_id: String,
+        project_name: String,
+        new_entry_content: String,
+        new_entry_count: i64,
+        config: LlmSettings,
+    ) -> Result<Option<String>, CoreError> {
+        Ok(self.inner.synthesize_project(
+            &project_id,
+            &project_name,
+            &new_entry_content,
+            new_entry_count,
+            &config.into(),
+        )?)
+    }
+
+    /// Port of `step6_vectorize` (T5): embed each entity's composite text and
+    /// store the vector; per-entity failures skip. Returns the count.
+    pub fn vectorize_entities(&self, entity_ids: Vec<String>) -> Result<i64, CoreError> {
+        Ok(self.inner.vectorize_entities(&entity_ids)?)
+    }
+
+    /// SYN-23 — render the gathered week (JSON string) into the digest
+    /// markdown (prompt = data `digest.md`, LLM via the core HTTP path).
+    pub fn summarize_digest(
+        &self,
+        week_json: String,
+        config: LlmSettings,
+    ) -> Result<String, CoreError> {
+        let week: serde_json::Value = serde_json::from_str(&week_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        Ok(self.inner.summarize_digest(&week, &config.into())?)
+    }
+
+    /// SYN-23 — store the digest note (idempotent per ISO week) + its vector,
+    /// on the Brain's OWN connection: call outside host transactions. Returns
+    /// the note id.
+    pub fn write_digest_note(
+        &self,
+        week_json: String,
+        markdown: String,
+    ) -> Result<String, CoreError> {
+        let week: serde_json::Value = serde_json::from_str(&week_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        Ok(self.inner.write_digest_note(&week, &markdown)?)
+    }
+
+    /// SYN-21 — process every URL found in a capture (each independent, one
+    /// failure never blocks the others). `config = None` → snippet-fallback
+    /// summaries (no LLM). Returns the stored resource ids as a JSON array.
+    pub fn process_capture_resources(
+        &self,
+        content: String,
+        capture_id: Option<String>,
+        config: Option<LlmSettings>,
+    ) -> Result<String, CoreError> {
+        let cfg: Option<synapse_core::LlmConfig> = config.map(Into::into);
+        let ids = self
+            .inner
+            .process_capture_resources(&content, capture_id.as_deref(), cfg.as_ref())?;
+        Ok(serde_json::Value::from(ids).to_string())
     }
 
     pub fn validate_pending(&self, new_facts_json: String) -> Result<i64, CoreError> {
