@@ -25,6 +25,12 @@ cargo run -p synapse-core-ffi --bin uniffi-bindgen -- generate \
     --library target/debug/libsynapse_core_ffi.dylib \
     --language kotlin --out-dir "$OUT/kotlin"
 
+# The Rust cdylib links against libc++_shared (tokenizers' C++ deps): the
+# APK must ship it too (bitten on-device: dlopen "libc++_shared.so" not
+# found). Vendor it from the NDK next to our .so.
+NDK_DIR="${ANDROID_NDK_HOME:-$(ls -d "$HOME/Library/Android/sdk/ndk/"* 2>/dev/null | sort -V | tail -1)}"
+SYSROOT_LIBS="$NDK_DIR/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib"
+
 for t in "${TARGETS[@]}"; do
     case "$t" in
         arm64-v8a) rust_target=aarch64-linux-android ;;
@@ -33,6 +39,7 @@ for t in "${TARGETS[@]}"; do
     esac
     mkdir -p "$OUT/jniLibs/$t"
     cp "target/$rust_target/release/libsynapse_core_ffi.so" "$OUT/jniLibs/$t/"
+    cp "$SYSROOT_LIBS/$rust_target/libc++_shared.so" "$OUT/jniLibs/$t/"
 done
 
 echo "OK — artifacts in $OUT:"
