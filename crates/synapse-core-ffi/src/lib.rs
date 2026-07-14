@@ -325,6 +325,22 @@ impl SqlConnection {
         Ok(self.inner.generated_for_capture(&capture_id)?.to_string())
     }
 
+    /// SYN-135 — apply one app action-log entry (validate/archive/rename/
+    /// relation CRUD/merge accept/…) to this local db, mirroring the desktop
+    /// backend's write endpoints. Own IMMEDIATE transaction; returns the
+    /// outcome JSON (`status` = ok/confirmed/accepted/… or not_found/skipped
+    /// for moot replays).
+    pub fn apply_action(
+        &self,
+        action_type: String,
+        payload_json: String,
+    ) -> Result<String, CoreError> {
+        Ok(self
+            .inner
+            .apply_action(&action_type, &payload_json)?
+            .to_string())
+    }
+
     // ── Full-cycle passes (SYN-130): the mobile host runs the same Dream
     // Cycle as the desktop backend, so the T5 surface crosses the FFI too. ──
 

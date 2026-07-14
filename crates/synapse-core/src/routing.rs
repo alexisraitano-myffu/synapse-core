@@ -1114,7 +1114,9 @@ pub(crate) fn query_row_maps(
 
 /// Port of `_find_existing_entity`: primary SQL-cased lookup, then the
 /// Python-cased alias scan (first DB-row match wins).
-fn find_existing_entity(
+/// pub(crate): `actions.rs` (SYN-135) resolves validated pending facts
+/// alias-aware, exactly like `dream_cycle/validation.py` (SYN-87).
+pub(crate) fn find_existing_entity(
     conn: &Connection,
     canonical_name: &str,
     aliases: &[String],
@@ -1368,7 +1370,7 @@ pub(crate) fn insert_fact(
 
 /// Bind a JSON scalar like Python bound the native value (str/int/float/
 /// bool/None); structures fall back to their compact JSON text.
-fn json_scalar_to_sql(v: &Value) -> SqlV {
+pub(crate) fn json_scalar_to_sql(v: &Value) -> SqlV {
     match v {
         Value::Null => SqlV::Null,
         Value::Bool(b) => SqlV::Integer(*b as i64),
@@ -1601,7 +1603,7 @@ pub(crate) fn entity_embedding_text(entity: &Map<String, Value>) -> String {
 
 /// `json.dumps(v, ensure_ascii=False)` — Python's default separators
 /// (", ", ": ") and insertion order (serde_json preserve_order).
-fn py_dumps(v: &Value) -> String {
+pub(crate) fn py_dumps(v: &Value) -> String {
     match v {
         Value::Object(m) => {
             let inner: Vec<String> = m

@@ -221,6 +221,26 @@ impl SqlConnection {
         crate::snapshot::generated_for_capture(&conn, capture_id)
     }
 
+    /// SYN-135 — apply one app action-log entry (validate/archive/rename/
+    /// relation CRUD/merge accept/…) to THIS local db, mirroring the desktop
+    /// backend's write endpoints (see `actions.rs`). Wrapped in its own
+    /// IMMEDIATE transaction: compound actions (merge reroute, promotion)
+    /// must be atomic, and the sync triggers journal every write.
+    pub fn apply_action(
+        &self,
+        action_type: &str,
+        payload_json: &str,
+    ) -> Result<serde_json::Value, CoreError> {
+        let conn = self.lock()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = crate::actions::apply_action(&tx, action_type, payload_json)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Full reactivation of every note mentioning one of `entity_names`.
     pub fn reactivate_notes_for_entities(
         &self,
