@@ -68,6 +68,9 @@ pub fn apply_action(
         "reject_project_attach" => {
             resolve_proposal(conn, "project_attach_proposals", s(p, "id"), "rejected")
         }
+        "rename_space" => rename_space(conn, p),
+        "rename_device" => rename_device(conn, p),
+        "set_device_revoked" => set_device_revoked(conn, p),
         other => Err(CoreError::Storage(format!("unknown action type '{other}'"))),
     }
 }
@@ -806,6 +809,79 @@ fn accept_project_attach(conn: &Connection, p: &Map<String, Value>) -> Result<Va
     }))
 }
 
+// ── space + devices (SYN-139) ────────────────────────────────────────────────
+// Mirrors of `PATCH /space` and `PATCH /device/{id}`. The HTTP guards (422 on
+// blank name, 409 on self-revoke / revoking the weaver) become Ok statuses
+// here: the UI blocks those gestures upfront, and a queued action must never
+// wedge on a state a peer changed first.
+
+/// Port of `app.py::space_patch`.
+fn rename_space(conn: &Connection, p: &Map<String, Value>) -> Result<Value, CoreError> {
+    let Some(name) = opt(p, "name") else {
+        return ok("invalid_name");
+    };
+    let n = conn.execute(
+        "UPDATE space SET name = ?1 WHERE id = 'space'",
+        params![name],
+    )?;
+    if n == 0 {
+        return not_found();
+    }
+    ok("ok")
+}
+
+/// Port of the rename half of `app.py::device_patch`.
+fn rename_device(conn: &Connection, p: &Map<String, Value>) -> Result<Value, CoreError> {
+    let Some(name) = opt(p, "name") else {
+        return ok("invalid_name");
+    };
+    let n = conn.execute(
+        "UPDATE devices SET name = ?1 WHERE device_id = ?2",
+        params![name, s(p, "deviceId")],
+    )?;
+    if n == 0 {
+        return not_found();
+    }
+    ok("ok")
+}
+
+/// Port of the revoke/restore half of `app.py::device_patch`.
+fn set_device_revoked(conn: &Connection, p: &Map<String, Value>) -> Result<Value, CoreError> {
+    let device_id = s(p, "deviceId");
+    let revoked = is_true(p, "revoked");
+    if revoked {
+        if device_id == crate::sync::device_id(conn)? {
+            return ok("rejected_self_revoke");
+        }
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT device_id FROM sync_owner WHERE id = 'owner'",
+                [],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if owner.as_deref() == Some(device_id) {
+            return ok("rejected_weaver");
+        }
+    }
+    let n = conn.execute(
+        if revoked {
+            "UPDATE devices SET revoked_at = CURRENT_TIMESTAMP WHERE device_id = ?1"
+        } else {
+            "UPDATE devices SET revoked_at = NULL WHERE device_id = ?1"
+        },
+        params![device_id],
+    )?;
+    if n == 0 {
+        return not_found();
+    }
+    ok("ok")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +902,101 @@ mod tests {
 
     fn one<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str, id: &str) -> T {
         conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn space_and_device_actions_apply_the_backend_guards() {
+        let (_dir, conn) = setup();
+        let me: String = conn
+            .query_row("SELECT v FROM sync_meta WHERE k = 'device_id'", [], |r| r.get(0))
+            .unwrap();
+
+        // No space founded yet → not_found, the queue moves on.
+        let r = apply(&conn, "rename_space", json!({"name": "Notre mémoire"}));
+        assert_eq!(r["status"], "not_found");
+        conn.execute(
+            "INSERT INTO space (id, space_id, name) VALUES ('space', 'sp-1', 'Ma mémoire')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(apply(&conn, "rename_space", json!({"name": ""}))["status"], "invalid_name");
+        assert_eq!(
+            apply(&conn, "rename_space", json!({"name": "Notre mémoire"}))["status"],
+            "ok"
+        );
+        let name: String = conn
+            .query_row("SELECT name FROM space WHERE id = 'space'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Notre mémoire");
+
+        conn.execute(
+            "INSERT INTO devices (device_id, name, platform) VALUES \
+             (?1, 'Pixel 9a', 'android'), ('dev-mac', 'Macmini', 'darwin')",
+            params![me],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_owner (id, device_id, epoch) VALUES ('owner', ?1, 1)",
+            params![me],
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply(&conn, "rename_device", json!({"deviceId": "dev-mac", "name": "Mac du salon"}))
+                ["status"],
+            "ok"
+        );
+        let name: String = one(
+            &conn,
+            "SELECT name FROM devices WHERE device_id = ?1",
+            "dev-mac",
+        );
+        assert_eq!(name, "Mac du salon");
+        assert_eq!(
+            apply(&conn, "rename_device", json!({"deviceId": "ghost", "name": "X"}))["status"],
+            "not_found"
+        );
+
+        // A device cannot revoke itself, and the weaver must hand over first.
+        let r = apply(
+            &conn,
+            "set_device_revoked",
+            json!({"deviceId": me, "revoked": "true"}),
+        );
+        assert_eq!(r["status"], "rejected_self_revoke");
+        conn.execute("UPDATE sync_owner SET device_id = 'dev-mac' WHERE id = 'owner'", [])
+            .unwrap();
+        let r = apply(
+            &conn,
+            "set_device_revoked",
+            json!({"deviceId": "dev-mac", "revoked": "true"}),
+        );
+        assert_eq!(r["status"], "rejected_weaver");
+        conn.execute("UPDATE sync_owner SET device_id = ?1 WHERE id = 'owner'", params![me])
+            .unwrap();
+        assert_eq!(
+            apply(&conn, "set_device_revoked", json!({"deviceId": "dev-mac", "revoked": "true"}))
+                ["status"],
+            "ok"
+        );
+        let revoked: Option<String> = one(
+            &conn,
+            "SELECT revoked_at FROM devices WHERE device_id = ?1",
+            "dev-mac",
+        );
+        assert!(revoked.is_some());
+        // Restore is unguarded, like the backend.
+        assert_eq!(
+            apply(&conn, "set_device_revoked", json!({"deviceId": "dev-mac", "revoked": "false"}))
+                ["status"],
+            "ok"
+        );
+        let revoked: Option<String> = one(
+            &conn,
+            "SELECT revoked_at FROM devices WHERE device_id = ?1",
+            "dev-mac",
+        );
+        assert!(revoked.is_none());
     }
 
     #[test]

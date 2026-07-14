@@ -248,6 +248,61 @@ fn merge_proposals(conn: &Connection) -> Result<Vec<Value>, CoreError> {
     Ok(out)
 }
 
+/// The `GET /space` payload (SYN-139): replicated singleton + who we are and
+/// who tisses. `space` stays null until the owner founds it (first cycle).
+fn space(conn: &Connection) -> Result<Value, CoreError> {
+    let space = first_row(
+        conn,
+        "SELECT space_id, name, created_at FROM space WHERE id = 'space'",
+        &[],
+    )?;
+    let owner = first_row(
+        conn,
+        "SELECT device_id FROM sync_owner WHERE id = 'owner'",
+        &[],
+    )?;
+    Ok(json!({
+        "space": space.map(Value::Object).unwrap_or(Value::Null),
+        "device_id": crate::sync::device_id(conn)?,
+        "owner_device_id": owner
+            .and_then(|mut r| r.remove("device_id"))
+            .unwrap_or(Value::Null),
+    }))
+}
+
+/// The `GET /devices` payload (SYN-139). `last_pull_at` is a backend notion
+/// (its per-peer pull cursors, `sync_meta 'pulled_at:%'`); the mesh copy has
+/// no local equivalent, so the field is omitted and the app DTO's null
+/// default applies.
+fn devices(conn: &Connection) -> Result<Vec<Value>, CoreError> {
+    let me = crate::sync::device_id(conn)?;
+    let owner_id = first_row(
+        conn,
+        "SELECT device_id FROM sync_owner WHERE id = 'owner'",
+        &[],
+    )?
+    .and_then(|mut r| r.remove("device_id"))
+    .and_then(|v| v.as_str().map(str::to_owned));
+    let rows = query_rows(
+        conn,
+        "SELECT device_id, name, platform, last_seen, revoked_at \
+         FROM devices ORDER BY (device_id = ?1) DESC, name",
+        &[&me],
+    )?;
+    let mut out = Vec::new();
+    for mut r in rows {
+        let id = display(r.get("device_id"));
+        r.insert("is_self".into(), json!(id == me));
+        r.insert("is_owner".into(), json!(owner_id.as_deref() == Some(id.as_str())));
+        r.insert(
+            "revoked".into(),
+            json!(!matches!(r.get("revoked_at"), None | Some(Value::Null))),
+        );
+        out.push(Value::Object(r));
+    }
+    Ok(out)
+}
+
 /// The whole local read snapshot, one JSON object per consumed endpoint.
 pub fn read_snapshot(conn: &Connection) -> Result<Value, CoreError> {
     let projects = query_rows(conn, PROJECTS_SQL, &[])?;
@@ -293,6 +348,8 @@ pub fn read_snapshot(conn: &Connection) -> Result<Value, CoreError> {
         "merge_proposals": merge_proposals(conn)?,
         "type_proposals": type_proposals,
         "project_attach_proposals": attach_proposals,
+        "space": space(conn)?,
+        "devices": devices(conn)?,
     }))
 }
 
@@ -407,6 +464,59 @@ mod tests {
         assert_eq!(snap["feed"][0]["status"], "processed");
         assert!(changes["cursor"].as_str().unwrap().contains('T'));
         assert!(changes["instance_id"].is_string());
+    }
+
+    #[test]
+    fn snapshot_carries_space_and_devices() {
+        let (_dir, conn) = setup();
+        let me: String = conn
+            .query_row("SELECT v FROM sync_meta WHERE k = 'device_id'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO space (id, space_id, name) VALUES ('space', 'sp-1', 'Mémoire')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_owner (id, device_id, epoch) VALUES ('owner', 'dev-b', 4)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO devices (device_id, name, platform, last_seen, revoked_at) VALUES \
+             (?1, 'Pixel 9a', 'android', '2026-07-14 10:00:00', NULL), \
+             ('dev-b', 'Macmini', 'macos', '2026-07-14 09:00:00', NULL), \
+             ('dev-c', 'Ancien', 'macos', NULL, '2026-07-01 08:00:00')",
+            [&me],
+        )
+        .unwrap();
+
+        let snap = read_snapshot(&conn).unwrap();
+        // /space shape: singleton + who we are + who tisses.
+        assert_eq!(snap["space"]["space"]["space_id"], "sp-1");
+        assert_eq!(snap["space"]["space"]["name"], "Mémoire");
+        assert_eq!(snap["space"]["device_id"], json!(me));
+        assert_eq!(snap["space"]["owner_device_id"], "dev-b");
+        // /devices shape: self first, flags computed locally, no last_pull_at.
+        let devices = snap["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 3);
+        assert_eq!(devices[0]["device_id"], json!(me));
+        assert_eq!(devices[0]["is_self"], true);
+        assert_eq!(devices[0]["is_owner"], false);
+        assert_eq!(devices[0]["revoked"], false);
+        let mac = devices.iter().find(|d| d["device_id"] == "dev-b").unwrap();
+        assert_eq!(mac["is_owner"], true);
+        assert_eq!(mac["is_self"], false);
+        let old = devices.iter().find(|d| d["device_id"] == "dev-c").unwrap();
+        assert_eq!(old["revoked"], true);
+        assert!(devices[0].get("last_pull_at").is_none());
+
+        // A db founded by nobody yet: space null, owner null, devices empty.
+        let (_dir2, fresh) = setup();
+        let snap2 = read_snapshot(&fresh).unwrap();
+        assert_eq!(snap2["space"]["space"], Value::Null);
+        assert_eq!(snap2["space"]["owner_device_id"], Value::Null);
+        assert_eq!(snap2["devices"], json!([]));
     }
 
     #[test]
