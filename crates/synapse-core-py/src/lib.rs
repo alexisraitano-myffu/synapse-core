@@ -69,6 +69,12 @@ impl Embedder {
         // ONNX inference can take tens of ms: release the GIL while it runs.
         py.detach(|| self.inner.embed(text)).map_err(core_err)
     }
+
+    /// One vector per ~128-token window of the text (SYN-118); a short text
+    /// yields a single vector identical to `embed`.
+    fn embed_chunks(&self, py: Python<'_>, text: &str) -> PyResult<Vec<Vec<f32>>> {
+        py.detach(|| self.inner.embed_chunks(text)).map_err(core_err)
+    }
 }
 
 /// Storage substrate backed by the shared Rust core (SYN-110 / T1).
@@ -100,6 +106,18 @@ impl Storage {
 
     fn upsert_note_vector(&self, py: Python<'_>, note_id: &str, embedding: &[u8]) -> PyResult<()> {
         py.detach(|| self.inner.upsert_note_vector(note_id, embedding))
+            .map_err(core_err)
+    }
+
+    /// Chunked upsert (SYN-118): one blob per ~128-token window, chunk 0
+    /// keyed by the note uuid (back-compat), then `uuid#k`.
+    fn upsert_note_vectors(
+        &self,
+        py: Python<'_>,
+        note_id: &str,
+        embeddings: Vec<Vec<u8>>,
+    ) -> PyResult<()> {
+        py.detach(|| self.inner.upsert_note_vectors(note_id, &embeddings))
             .map_err(core_err)
     }
 

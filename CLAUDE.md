@@ -43,7 +43,7 @@ Workspace à 3 crates, avec une règle dure : **toute la logique vit dans `crate
 
 - **Matrice de versions** : fastembed 5.17 → ort `=2.0.0-rc.12` (api-24) → onnxruntime ≥ 1.24 (AAR Android `1.27.0`). Un onnxruntime trop vieux ne donne pas d'erreur : ort rc.12 **deadlocke** (OnceLock réentrant dans son chemin d'erreur). Ne bumper fastembed/ort qu'ensemble, en revérifiant la matrice.
 - **`ORT_DYLIB_PATH` ne doit jamais pointer vers un chemin inexistant** (même deadlock). Sur Android (`extractNativeLibs=false`), les .so ne sont pas extraits sur disque : précharger via `System.loadLibrary("onnxruntime")` et laisser ort dlopen par soname.
-- Troncature embeddings : le modèle qdrant tronque à **128 tokens** (min de `max_length`/`model_max_length` dans `tokenizer_config.json`, comme fastembed Python). Toute évolution (SYN-118) passe par les fichiers modèle, pas par le code.
+- Troncature embeddings : le modèle qdrant tronque à **128 tokens** (min de `max_length`/`model_max_length` dans `tokenizer_config.json`, comme fastembed Python) — et 128 est le BON granule pour ce modèle de phrases : embedder un texte long en un seul vecteur 512 **dilue** (mesuré SYN-118 : les requêtes tête ET queue chutent). Depuis SYN-118 les textes longs sont **chunkés** : `Embedder::embed_chunks` = un vecteur par fenêtre de ~128 tokens (overlap 24, max 16 fenêtres) ; notes = une ligne vec0 par chunk (clé `uuid` puis `uuid#k`, `search_notes` déduplique au meilleur chunk) ; ressources = frames concaténées dans le BLOB (`score_against_frames` = max). vec0 ne supporte pas INSERT OR REPLACE : l'upsert balaie puis insère.
 - `intra_threads(1)` sur mobile.
 
 ## Tests

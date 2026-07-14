@@ -326,7 +326,9 @@ impl Brain {
             return Ok(None);
         };
         let summary = summarize(config, &page.title, &page.text);
-        let embedding = self.embed(&format!("{}\n{}", page.title, summary));
+        // Multi-frame blob (SYN-118): a long summary embeds per window and the
+        // resource scorer keeps the best frame.
+        let embedding = self.embed_frames(&format!("{}\n{}", page.title, summary));
 
         let rid = new_uuid();
         let now = crate::decay::resolve_now(None)

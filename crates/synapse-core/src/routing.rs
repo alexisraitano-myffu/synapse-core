@@ -128,6 +128,24 @@ impl Brain {
         Some(vec.iter().flat_map(|x| x.to_le_bytes()).collect())
     }
 
+    /// One serialized vector per ~128-token window (SYN-118): the storage
+    /// keeps them all and search takes the best window per note.
+    pub(crate) fn embed_chunks(&self, text: &str) -> Option<Vec<Vec<u8>>> {
+        let chunks = self.embedder.as_ref()?.embed_chunks(text).ok()?;
+        Some(
+            chunks
+                .into_iter()
+                .map(|v| v.iter().flat_map(|x| x.to_le_bytes()).collect())
+                .collect(),
+        )
+    }
+
+    /// Chunk vectors concatenated into ONE blob (SYN-118) — the layout of the
+    /// `entities`/`resources` embedding columns; scorers take the best frame.
+    pub(crate) fn embed_frames(&self, text: &str) -> Option<Vec<u8>> {
+        Some(self.embed_chunks(text)?.concat())
+    }
+
     /// Embed arbitrary text with the Brain's already-loaded embedder — the
     /// host-side re-embed path after a sync apply (mirror of the backend's
     /// `embed_text`), without paying a second model load.
@@ -348,8 +366,8 @@ impl Brain {
 
         // Post-commit, best-effort — mirrors the deferred vec flush.
         if let Some((note_id, text)) = pending_note_vec {
-            if let Some(vec) = self.embed(&text) {
-                let _ = self.storage.upsert_note_vector(&note_id, &vec);
+            if let Some(chunks) = self.embed_chunks(&text) {
+                let _ = self.storage.upsert_note_vectors(&note_id, &chunks);
             }
         }
 

@@ -54,6 +54,11 @@ impl Embedder {
     pub fn embed(&self, text: String) -> Result<Vec<f32>, CoreError> {
         Ok(self.inner.embed(&text)?)
     }
+
+    /// One vector per ~128-token window (SYN-118); short text = one vector.
+    pub fn embed_chunks(&self, text: String) -> Result<Vec<Vec<f32>>, CoreError> {
+        Ok(self.inner.embed_chunks(&text)?)
+    }
 }
 
 /// A note KNN hit; `distance` is sqlite-vec's L2 on unit vectors ([0, 2]).
@@ -101,6 +106,15 @@ impl Storage {
 
     pub fn upsert_note_vector(&self, note_id: String, embedding: Vec<u8>) -> Result<(), CoreError> {
         Ok(self.inner.upsert_note_vector(&note_id, &embedding)?)
+    }
+
+    /// Chunked upsert (SYN-118): chunk 0 keyed by the note uuid, then `uuid#k`.
+    pub fn upsert_note_vectors(
+        &self,
+        note_id: String,
+        embeddings: Vec<Vec<u8>>,
+    ) -> Result<(), CoreError> {
+        Ok(self.inner.upsert_note_vectors(&note_id, &embeddings)?)
     }
 
     pub fn delete_note_vector(&self, note_id: String) -> Result<(), CoreError> {

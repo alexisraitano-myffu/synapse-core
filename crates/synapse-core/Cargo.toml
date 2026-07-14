@@ -15,6 +15,7 @@ ort-dynamic = ["fastembed/ort-load-dynamic"]
 
 [dependencies]
 fastembed = { workspace = true }
+tokenizers = { workspace = true }
 thiserror = { workspace = true }
 # preserve_order: Python dict insertion order shapes JSON bytes that get
 # embedded (attributes in entity_embedding_text) — BTreeMap would reorder.
