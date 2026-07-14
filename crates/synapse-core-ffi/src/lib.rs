@@ -313,6 +313,18 @@ impl SqlConnection {
         Ok(self.inner.last_insert_rowid()?)
     }
 
+    /// SYN-132 — one-call read snapshot for the app's local replica: the same
+    /// JSON shapes as the desktop backend's read endpoints, served from this
+    /// local core db.
+    pub fn read_snapshot(&self) -> Result<String, CoreError> {
+        Ok(self.inner.read_snapshot()?.to_string())
+    }
+
+    /// SYN-132 — reverse provenance of one capture (`/capture/{id}/generated`).
+    pub fn generated_for_capture(&self, capture_id: String) -> Result<String, CoreError> {
+        Ok(self.inner.generated_for_capture(&capture_id)?.to_string())
+    }
+
     // ── Full-cycle passes (SYN-130): the mobile host runs the same Dream
     // Cycle as the desktop backend, so the T5 surface crosses the FFI too. ──
 

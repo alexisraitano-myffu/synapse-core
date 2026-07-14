@@ -206,6 +206,21 @@ impl SqlConnection {
         crate::digest::gather_week(&conn, crate::decay::resolve_now(now_sql), days)
     }
 
+    /// SYN-132 — one-call read snapshot for an app replica fed by THIS local
+    /// core db instead of the desktop backend's HTTP endpoints. Same JSON
+    /// shapes as `/changes`, `/feed`, `/projects`, `/project/{id}/state`,
+    /// `/pending` and the proposal lists (see `snapshot.rs`).
+    pub fn read_snapshot(&self) -> Result<serde_json::Value, CoreError> {
+        let conn = self.lock()?;
+        crate::snapshot::read_snapshot(&conn)
+    }
+
+    /// SYN-132 — reverse provenance of one capture (`/capture/{id}/generated`).
+    pub fn generated_for_capture(&self, capture_id: &str) -> Result<serde_json::Value, CoreError> {
+        let conn = self.lock()?;
+        crate::snapshot::generated_for_capture(&conn, capture_id)
+    }
+
     /// Full reactivation of every note mentioning one of `entity_names`.
     pub fn reactivate_notes_for_entities(
         &self,

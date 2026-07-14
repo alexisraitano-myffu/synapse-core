@@ -20,6 +20,7 @@ mod pairing;
 mod resources;
 mod routing;
 mod schema;
+mod snapshot;
 mod sql;
 mod storage;
 mod summaries;
