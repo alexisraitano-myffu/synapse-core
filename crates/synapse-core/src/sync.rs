@@ -77,6 +77,8 @@ fn synced_tables() -> &'static [(&'static str, &'static str)] {
         ("entity_type_proposals", "id"),
         ("project_attach_proposals", "id"),
         ("sync_owner", "id"),
+        ("space", "id"),
+        ("devices", "device_id"),
     ]
 }
 
@@ -490,10 +492,18 @@ pub(crate) fn apply_changes(conn: &Connection, changes_json: &str) -> Result<Str
         }
         let n = tx.execute(&format!("DELETE FROM \"{tbl}\" WHERE \"{pkc}\" = ?1"), params![pk])?;
         if tbl == "atomic_notes" {
+            // Sweep every chunk key (`uuid` then `uuid#k`, SYN-118) — a
+            // replicated delete must not leave orphan chunk vectors behind.
             tx.execute(
                 "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
                 params![pk],
             )?;
+            for k in 1..crate::embedder::MAX_CHUNKS {
+                tx.execute(
+                    "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
+                    params![format!("{pk}#{k}")],
+                )?;
+            }
             note_touched(pk, &mut note_set, &mut notes_changed);
         }
         tx.execute(
@@ -750,6 +760,48 @@ mod tests {
         assert_eq!(
             Some("-".to_string()),
             query_one(&s, "SELECT col FROM sync_log WHERE tbl='entities' AND pk='e1'")
+        );
+    }
+
+    #[test]
+    // SYN-127 — the space singleton and the device registry travel the mesh
+    // like any replicated table: a rename on one peer reaches the other.
+    #[test]
+    fn space_and_devices_replicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = mem_store(&dir, "a.db");
+        let b = mem_store(&dir, "b.db");
+
+        exec(
+            &a,
+            "INSERT INTO space (id, space_id, name) VALUES ('space', 'uuid-s', 'Ma mémoire')",
+        );
+        exec(
+            &a,
+            "INSERT INTO devices (device_id, name, platform, last_seen) \
+             VALUES ('dev-a', 'MacBook salon', 'macos', CURRENT_TIMESTAMP)",
+        );
+        sync_once(&a, &b);
+        assert_eq!(
+            Some("Ma mémoire".into()),
+            query_one(&b, "SELECT name FROM space WHERE id='space'")
+        );
+        assert_eq!(
+            Some("MacBook salon".into()),
+            query_one(&b, "SELECT name FROM devices WHERE device_id='dev-a'")
+        );
+
+        // Rename on b propagates back to a; revocation too.
+        exec(&b, "UPDATE devices SET name = 'Mac du salon' WHERE device_id = 'dev-a'");
+        exec(&b, "UPDATE devices SET revoked_at = CURRENT_TIMESTAMP WHERE device_id = 'dev-a'");
+        sync_once(&b, &a);
+        assert_eq!(
+            Some("Mac du salon".into()),
+            query_one(&a, "SELECT name FROM devices WHERE device_id='dev-a'")
+        );
+        assert_eq!(
+            1,
+            count(&a, "SELECT count(*) FROM devices WHERE device_id='dev-a' AND revoked_at IS NOT NULL")
         );
     }
 
