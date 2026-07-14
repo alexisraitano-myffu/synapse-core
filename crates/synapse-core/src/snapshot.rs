@@ -151,12 +151,24 @@ fn project_state(conn: &Connection, id: &str, name: &Value) -> Result<Value, Cor
         [id],
         |r| r.get(0),
     )?;
+    // SYN-134 — projects carry facts now; same ACTIVE-only slice as the
+    // backend endpoint (api/app.py::project_state).
+    let facts = query_rows(
+        conn,
+        "SELECT id, predicate, value, confidence, category, \
+                persistence_value, created_at, provenance_capture_id \
+         FROM facts WHERE entity_id = ?1 \
+         AND obsoleted_at IS NULL AND archived_at IS NULL \
+         ORDER BY created_at ASC",
+        &[&id],
+    )?;
     Ok(json!({
         "project_id": id,
         "canonical_name": name,
         "current_state": state,
         "entries_recent": entries,
         "entries_total": total,
+        "facts": facts,
     }))
 }
 
