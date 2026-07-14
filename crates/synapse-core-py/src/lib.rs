@@ -872,12 +872,115 @@ fn fetch_and_extract(py: Python<'_>, url: &str, timeout: f64) -> Option<String> 
         .map(|p| serde_json::json!({"title": p.title, "text": p.text}).to_string())
 }
 
+/// Pairing offerer session (SYN-128): the device that SHOWS the QR keeps this
+/// between showing the offer and receiving the scanner's returned key.
+#[pyclass]
+struct PairingSession {
+    inner: synapse_core::PairingSession,
+    offer_pub: [u8; 32],
+}
+
+#[pymethods]
+impl PairingSession {
+    /// Start a pairing. `addrs` = how the joiner can reach us (LAN URLs).
+    /// Returns (session, qr_string). Render `qr_string` as a QR code.
+    #[staticmethod]
+    fn offer(addrs: Vec<String>) -> PyResult<(Self, String)> {
+        let (inner, offer) = synapse_core::PairingSession::offer(addrs).map_err(core_err)?;
+        let qr = offer.encode();
+        let offer_pub = inner.offer_public();
+        Ok((Self { inner, offer_pub }, qr))
+    }
+
+    /// The offerer's ephemeral public key (bytes), for AAD in seal.
+    fn offer_pub<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.offer_pub)
+    }
+
+    /// Complete with the scanner's returned public key → channel key (bytes).
+    fn channel_key<'py>(&self, py: Python<'py>, accept_pub: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        let ap: [u8; 32] = accept_pub
+            .try_into()
+            .map_err(|_| PyRuntimeError::new_err("accept_pub must be 32 bytes"))?;
+        Ok(PyBytes::new(py, &self.inner.channel_key(&ap)))
+    }
+}
+
+/// Scanner side (SYN-128): decode the QR, return (accept_pub, channel_key) as
+/// bytes. Send accept_pub back to the offerer over the transport.
+#[pyfunction]
+fn pairing_accept<'py>(
+    py: Python<'py>,
+    qr: &str,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let offer = synapse_core::PairingOffer::decode(qr).map_err(core_err)?;
+    let (accept_pub, key) = synapse_core::pairing_accept(&offer).map_err(core_err)?;
+    Ok((PyBytes::new(py, &accept_pub), PyBytes::new(py, &key)))
+}
+
+/// The reachability hints embedded in a QR offer (so a joiner knows where to
+/// call back) — decoded without completing the exchange.
+#[pyfunction]
+fn pairing_offer_addrs(qr: &str) -> PyResult<Vec<String>> {
+    Ok(synapse_core::PairingOffer::decode(qr)
+        .map_err(core_err)?
+        .addrs)
+}
+
+/// AEAD-seal a payload under the channel key (SYN-128). Returns base64.
+#[pyfunction]
+fn pairing_seal(
+    channel_key: &[u8],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
+    plaintext: &[u8],
+) -> PyResult<String> {
+    let (ck, op, ap) = pairing_keys(channel_key, offer_pub, accept_pub)?;
+    synapse_core::pairing_seal(&ck, &op, &ap, plaintext).map_err(core_err)
+}
+
+/// Open what `pairing_seal` produced (SYN-128) → the plaintext bytes.
+#[pyfunction]
+fn pairing_open<'py>(
+    py: Python<'py>,
+    channel_key: &[u8],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
+    sealed_b64: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let (ck, op, ap) = pairing_keys(channel_key, offer_pub, accept_pub)?;
+    let out = synapse_core::pairing_open(&ck, &op, &ap, sealed_b64).map_err(core_err)?;
+    Ok(PyBytes::new(py, &out))
+}
+
+fn pairing_keys(
+    channel_key: &[u8],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
+) -> PyResult<([u8; 32], [u8; 32], [u8; 32])> {
+    let ck: [u8; 32] = channel_key
+        .try_into()
+        .map_err(|_| PyRuntimeError::new_err("channel_key must be 32 bytes"))?;
+    let op: [u8; 32] = offer_pub
+        .try_into()
+        .map_err(|_| PyRuntimeError::new_err("offer_pub must be 32 bytes"))?;
+    let ap: [u8; 32] = accept_pub
+        .try_into()
+        .map_err(|_| PyRuntimeError::new_err("accept_pub must be 32 bytes"))?;
+    Ok((ck, op, ap))
+}
+
 #[pymodule(name = "synapse_core")]
 fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Embedder>()?;
     m.add_class::<Storage>()?;
     m.add_class::<SqlConnection>()?;
     m.add_class::<Brain>()?;
+    m.add_class::<PairingSession>()?;
+    m.add_function(wrap_pyfunction!(pairing_accept, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_offer_addrs, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_seal, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_open, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(parse_classify_text, m)?)?;
     m.add_function(wrap_pyfunction!(next_occurrence, m)?)?;
