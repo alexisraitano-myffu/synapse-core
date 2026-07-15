@@ -71,6 +71,9 @@ pub fn apply_action(
         "rename_space" => rename_space(conn, p),
         "rename_device" => rename_device(conn, p),
         "set_device_revoked" => set_device_revoked(conn, p),
+        "confirm_note" => confirm_pending(conn, "atomic_notes", s(p, "noteId")),
+        "confirm_relation" => confirm_pending(conn, "relations", s(p, "relationId")),
+        "requeue_capture" => requeue_capture(conn, s(p, "captureId")),
         other => Err(CoreError::Storage(format!("unknown action type '{other}'"))),
     }
 }
@@ -809,6 +812,47 @@ fn accept_project_attach(conn: &Connection, p: &Map<String, Value>) -> Result<Va
     }))
 }
 
+// ── « À valider » : tâches + liens + retry capture (SYN-143) ─────────────────
+
+/// Ports of `app.py::note_confirm` / `relation_confirm`: promote a
+/// low-confidence row from review_status='pending' into the live view.
+/// A peer may have validated it first — that replays as "skipped".
+fn confirm_pending(conn: &Connection, table: &str, id: &str) -> Result<Value, CoreError> {
+    let n = conn.execute(
+        &format!(
+            "UPDATE {table} SET review_status = 'confirmed' \
+             WHERE id = ?1 AND review_status = 'pending'"
+        ),
+        params![id],
+    )?;
+    if n == 1 {
+        return ok("confirmed");
+    }
+    if row_exists(conn, table, id)? {
+        ok("skipped")
+    } else {
+        not_found()
+    }
+}
+
+/// Port of `app.py::inbox_requeue` (SYN-77): put a failed capture back in the
+/// queue for the next owned cycle.
+fn requeue_capture(conn: &Connection, id: &str) -> Result<Value, CoreError> {
+    let n = conn.execute(
+        "UPDATE inbox SET status='queued', processed_at=NULL, error=NULL \
+         WHERE id = ?1 AND status = 'failed'",
+        params![id],
+    )?;
+    if n == 1 {
+        return ok("queued");
+    }
+    if row_exists(conn, "inbox", id)? {
+        ok("skipped")
+    } else {
+        not_found()
+    }
+}
+
 // ── space + devices (SYN-139) ────────────────────────────────────────────────
 // Mirrors of `PATCH /space` and `PATCH /device/{id}`. The HTTP guards (422 on
 // blank name, 409 on self-revoke / revoking the weaver) become Ok statuses
@@ -902,6 +946,65 @@ mod tests {
 
     fn one<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str, id: &str) -> T {
         conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn pending_validation_and_requeue_actions() {
+        let (_dir, conn) = setup();
+        conn.execute(
+            "INSERT INTO entities (id, canonical_name) VALUES ('e1', 'Alexis'), ('e2', 'Arkose')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO atomic_notes (id, content, kind) VALUES ('n1', 'réserver le créneau', 'task')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE atomic_notes SET review_status = 'pending' WHERE id = 'n1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relations (id, entity_from, predicate, entity_to, review_status) \
+             VALUES ('r1', 'e1', 'climbs_at', 'e2', 'pending')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO inbox (id, content, status, error) VALUES ('c1', 'x', 'failed', 'boom')",
+            [],
+        )
+        .unwrap();
+
+        // Confirm promotes pending → confirmed ; replays are skipped, ghosts not_found.
+        assert_eq!(apply(&conn, "confirm_note", json!({"noteId": "n1"}))["status"], "confirmed");
+        let rs: String = one(&conn, "SELECT review_status FROM atomic_notes WHERE id = ?1", "n1");
+        assert_eq!(rs, "confirmed");
+        assert_eq!(apply(&conn, "confirm_note", json!({"noteId": "n1"}))["status"], "skipped");
+        assert_eq!(apply(&conn, "confirm_note", json!({"noteId": "ghost"}))["status"], "not_found");
+        assert_eq!(
+            apply(&conn, "confirm_relation", json!({"relationId": "r1"}))["status"],
+            "confirmed"
+        );
+        let rs: String = one(&conn, "SELECT review_status FROM relations WHERE id = ?1", "r1");
+        assert_eq!(rs, "confirmed");
+
+        // Requeue resets a failed capture ; only failed rows are eligible.
+        assert_eq!(apply(&conn, "requeue_capture", json!({"captureId": "c1"}))["status"], "queued");
+        let (st, err): (String, Option<String>) = conn
+            .query_row("SELECT status, error FROM inbox WHERE id = 'c1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(st, "queued");
+        assert!(err.is_none());
+        assert_eq!(apply(&conn, "requeue_capture", json!({"captureId": "c1"}))["status"], "skipped");
+        assert_eq!(
+            apply(&conn, "requeue_capture", json!({"captureId": "ghost"}))["status"],
+            "not_found"
+        );
     }
 
     #[test]

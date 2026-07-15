@@ -248,6 +248,48 @@ fn merge_proposals(conn: &Connection) -> Result<Vec<Value>, CoreError> {
     Ok(out)
 }
 
+/// The `GET /atomic-notes?review_status=pending` payload (SYN-143): the
+/// « À valider » task/event queue (low-confidence classifications).
+fn pending_tasks(conn: &Connection) -> Result<Vec<Value>, CoreError> {
+    let rows = query_rows(
+        conn,
+        "SELECT id, title, content, summary, entities_mentioned, memory_strength, \
+                provenance_capture_id, created_at, updated_at, \
+                kind, event_date, event_recurring, archived_at, review_status \
+         FROM atomic_notes WHERE archived_at IS NULL AND review_status = 'pending' \
+         ORDER BY created_at DESC LIMIT 50",
+        &[],
+    )?;
+    let mut out = Vec::new();
+    for mut r in rows {
+        let mentioned = r
+            .get("entities_mentioned")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([]));
+        r.insert("entities_mentioned".into(), mentioned);
+        out.push(Value::Object(r));
+    }
+    Ok(out)
+}
+
+/// The `GET /relations/pending` payload (SYN-143): low-confidence relations,
+/// names resolved on both ends.
+fn pending_relations(conn: &Connection) -> Result<Vec<Map<String, Value>>, CoreError> {
+    query_rows(
+        conn,
+        "SELECT r.id, r.predicate, r.confidence, r.provenance_capture_id, \
+                ef.canonical_name AS entity_from_name, \
+                et.canonical_name AS entity_to_name \
+         FROM relations r \
+         JOIN entities ef ON ef.id = r.entity_from \
+         JOIN entities et ON et.id = r.entity_to \
+         WHERE r.review_status = 'pending' ORDER BY r.created_at DESC",
+        &[],
+    )
+}
+
 /// The `GET /space` payload (SYN-139): replicated singleton + who we are and
 /// who tisses. `space` stays null until the owner founds it (first cycle).
 fn space(conn: &Connection) -> Result<Value, CoreError> {
@@ -350,6 +392,8 @@ pub fn read_snapshot(conn: &Connection) -> Result<Value, CoreError> {
         "project_attach_proposals": attach_proposals,
         "space": space(conn)?,
         "devices": devices(conn)?,
+        "pending_tasks": pending_tasks(conn)?,
+        "pending_relations": pending_relations(conn)?,
     }))
 }
 
@@ -464,6 +508,49 @@ mod tests {
         assert_eq!(snap["feed"][0]["status"], "processed");
         assert!(changes["cursor"].as_str().unwrap().contains('T'));
         assert!(changes["instance_id"].is_string());
+    }
+
+    #[test]
+    fn snapshot_carries_pending_tasks_and_relations() {
+        let (_dir, conn) = setup();
+        conn.execute(
+            "INSERT INTO entities (id, canonical_name) VALUES ('e1', 'Alexis'), ('e2', 'Arkose')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO atomic_notes (id, content, kind, entities_mentioned) \
+             VALUES ('n1', 'réserver le créneau', 'task', '[\"Arkose\"]'), \
+                    ('n2', 'note sûre', 'note', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE atomic_notes SET review_status = 'pending' WHERE id = 'n1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relations (id, entity_from, predicate, entity_to, review_status) \
+             VALUES ('r1', 'e1', 'climbs_at', 'e2', 'pending'), \
+                    ('r2', 'e1', 'works_at', 'e2', 'confirmed')",
+            [],
+        )
+        .unwrap();
+
+        let snap = read_snapshot(&conn).unwrap();
+        // Only the pending task surfaces, entities_mentioned decoded to a list.
+        let tasks = snap["pending_tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "n1");
+        assert_eq!(tasks[0]["review_status"], "pending");
+        assert_eq!(tasks[0]["entities_mentioned"], json!(["Arkose"]));
+        // Only the pending relation, names resolved on both ends.
+        let rels = snap["pending_relations"].as_array().unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0]["id"], "r1");
+        assert_eq!(rels[0]["entity_from_name"], "Alexis");
+        assert_eq!(rels[0]["entity_to_name"], "Arkose");
     }
 
     #[test]
