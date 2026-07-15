@@ -346,6 +346,312 @@ fn devices(conn: &Connection) -> Result<Vec<Value>, CoreError> {
 }
 
 /// The whole local read snapshot, one JSON object per consumed endpoint.
+/// Port of the map's exact `GET /graph?include_notes=true&cluster=true` call
+/// (SYN-145). Deliberately NOT ported: `layout` (x/y come from
+/// `node_positions`, a backend projection cache that never replicates — the
+/// app computes its own ForceLayout since SYN-64) and `clusters` labels/hulls
+/// (Haiku cache) — the core renders `clusters: []`. Communities come from a
+/// deterministic label propagation: stable across pulls, not id-identical to
+/// the backend's Louvain (accepted — the two sources never mix on screen:
+/// HTTP serves the map online, this snapshot only when the Mac is silent).
+fn graph(conn: &Connection) -> Result<Value, CoreError> {
+    use std::collections::HashMap;
+
+    // Entity nodes — the same visibility rules as `app.py::graph`.
+    let mut nodes: Vec<Map<String, Value>> = Vec::new();
+    for e in query_rows(
+        conn,
+        "SELECT e.id, e.canonical_name, e.type, e.mention_count, e.persistence_value, \
+                e.summary, e.last_mentioned, e.archived_at, e.memory_strength, \
+                (SELECT COUNT(*) FROM facts f WHERE f.entity_id = e.id \
+                   AND f.archived_at IS NULL AND f.obsoleted_at IS NULL) AS facts_count \
+         FROM entities e WHERE e.merged_into_id IS NULL AND e.status = 'active' \
+         AND e.archived_at IS NULL",
+        &[],
+    )? {
+        let mut n = Map::new();
+        n.insert("id".into(), e.get("id").cloned().unwrap_or(Value::Null));
+        n.insert("kind".into(), json!("entity"));
+        n.insert(
+            "label".into(),
+            e.get("canonical_name").cloned().unwrap_or(Value::Null),
+        );
+        n.insert("type".into(), e.get("type").cloned().unwrap_or(Value::Null));
+        n.insert(
+            "mention_count".into(),
+            e.get("mention_count").cloned().filter(|v| !v.is_null()).unwrap_or(json!(1)),
+        );
+        n.insert(
+            "persistence_value".into(),
+            e.get("persistence_value").cloned().filter(|v| !v.is_null()).unwrap_or(json!(3)),
+        );
+        n.insert("summary".into(), e.get("summary").cloned().unwrap_or(Value::Null));
+        n.insert(
+            "last_mentioned".into(),
+            e.get("last_mentioned").cloned().unwrap_or(Value::Null),
+        );
+        n.insert(
+            "facts_count".into(),
+            e.get("facts_count").cloned().filter(|v| !v.is_null()).unwrap_or(json!(0)),
+        );
+        n.insert(
+            "memory_strength".into(),
+            e.get("memory_strength").cloned().unwrap_or(Value::Null),
+        );
+        n.insert(
+            "archived_at".into(),
+            e.get("archived_at").cloned().unwrap_or(Value::Null),
+        );
+        n.insert("community_id".into(), Value::Null);
+        nodes.push(n);
+    }
+
+    // Relation edges — pending ones are hidden everywhere (SYN-143 queue).
+    let mut edges: Vec<Map<String, Value>> = Vec::new();
+    for r in query_rows(
+        conn,
+        "SELECT entity_from, entity_to, predicate, confidence FROM relations \
+         WHERE review_status != 'pending'",
+        &[],
+    )? {
+        let mut edge = Map::new();
+        edge.insert("from".into(), r.get("entity_from").cloned().unwrap_or(Value::Null));
+        edge.insert("to".into(), r.get("entity_to").cloned().unwrap_or(Value::Null));
+        edge.insert("label".into(), r.get("predicate").cloned().unwrap_or(Value::Null));
+        edge.insert("confidence".into(), r.get("confidence").cloned().unwrap_or(Value::Null));
+        edges.push(edge);
+    }
+
+    // Note nodes + mention edges. `entities_mentioned` stores canonical
+    // NAMES, not ids — resolve against the entity nodes already present.
+    let name_to_id: HashMap<String, String> = nodes
+        .iter()
+        .filter_map(|n| {
+            Some((
+                n.get("label")?.as_str()?.to_lowercase(),
+                n.get("id")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    for note in query_rows(
+        conn,
+        "SELECT id, title, summary, content, memory_strength, \
+                last_reactivated_at, created_at, entities_mentioned \
+         FROM atomic_notes WHERE archived_at IS NULL AND kind != 'digest' \
+         AND review_status != 'pending'",
+        &[],
+    )? {
+        let nid = format!("n:{}", display(note.get("id")));
+        let preview = note
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| note.get("summary").and_then(Value::as_str).filter(|s| !s.is_empty()))
+            .or_else(|| note.get("content").and_then(Value::as_str))
+            .unwrap_or("");
+        let mut n = Map::new();
+        n.insert("id".into(), json!(nid));
+        n.insert("kind".into(), json!("atomic_note"));
+        n.insert("label".into(), json!(preview.chars().take(60).collect::<String>()));
+        n.insert("type".into(), json!("atomic_note"));
+        n.insert("summary".into(), note.get("summary").cloned().unwrap_or(Value::Null));
+        n.insert(
+            "last_mentioned".into(),
+            note.get("last_reactivated_at")
+                .cloned()
+                .filter(|v| !v.is_null())
+                .or_else(|| note.get("created_at").cloned())
+                .unwrap_or(Value::Null),
+        );
+        n.insert(
+            "memory_strength".into(),
+            note.get("memory_strength").cloned().unwrap_or(Value::Null),
+        );
+        n.insert("community_id".into(), Value::Null);
+        nodes.push(n);
+        let mentioned: Vec<String> = note
+            .get("entities_mentioned")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+            .map(|v| {
+                v.into_iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in mentioned {
+            if let Some(eid) = name_to_id.get(&name.to_lowercase()) {
+                let mut edge = Map::new();
+                edge.insert("from".into(), json!(nid));
+                edge.insert("to".into(), json!(eid));
+                edge.insert("label".into(), json!("mentions"));
+                edge.insert("confidence".into(), json!(1.0));
+                edges.push(edge);
+            }
+        }
+    }
+
+    set_degree(&mut nodes, &edges);
+    // `max_nodes` ceiling (default 1000): salience = memory_strength × (degree+1).
+    if nodes.len() > 1000 {
+        let mut scored: Vec<(f64, String)> = nodes
+            .iter()
+            .map(|n| {
+                let ms = n.get("memory_strength").and_then(Value::as_f64).unwrap_or(0.0);
+                let deg = n.get("degree").and_then(Value::as_i64).unwrap_or(0);
+                (ms * (deg + 1) as f64, display(n.get("id")))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let keep: std::collections::HashSet<String> =
+            scored.into_iter().take(1000).map(|(_, id)| id).collect();
+        nodes.retain(|n| keep.contains(&display(n.get("id"))));
+        edges.retain(|e| {
+            keep.contains(&display(e.get("from"))) && keep.contains(&display(e.get("to")))
+        });
+        set_degree(&mut nodes, &edges);
+    }
+    assign_communities(&mut nodes, &edges);
+
+    // Clusters — the map only COLOURS a community that appears here (the
+    // backend's ≥3-members rule: smaller ones float as grey orphans). The
+    // backend labels them with cached Haiku calls; offline stand-in = the
+    // community's most salient entity name. Hulls stay empty (positions are
+    // a backend cache; the client layout doesn't need them).
+    let mut groups: std::collections::BTreeMap<i64, Vec<&Map<String, Value>>> =
+        std::collections::BTreeMap::new();
+    for n in &nodes {
+        if let Some(c) = n.get("community_id").and_then(Value::as_i64) {
+            groups.entry(c).or_default().push(n);
+        }
+    }
+    let clusters: Vec<Value> = groups
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 3)
+        .map(|(cid, members)| {
+            let label = members
+                .iter()
+                .filter(|n| n.get("kind").and_then(Value::as_str) == Some("entity"))
+                .max_by(|a, b| {
+                    let score = |n: &&&Map<String, Value>| {
+                        let ms = n.get("memory_strength").and_then(Value::as_f64).unwrap_or(0.0);
+                        let deg = n.get("degree").and_then(Value::as_i64).unwrap_or(0);
+                        ms * (deg + 1) as f64
+                    };
+                    score(a)
+                        .partial_cmp(&score(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // ties → stable pick by id
+                        .then_with(|| display(b.get("id")).cmp(&display(a.get("id"))))
+                })
+                .and_then(|n| n.get("label").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
+            json!({
+                "community_id": cid,
+                "label": label,
+                "size": members.len(),
+                "hull": [],
+            })
+        })
+        .collect();
+
+    Ok(json!({ "nodes": nodes, "edges": edges, "clusters": clusters }))
+}
+
+/// `app.py::_set_degree` — drives node size on the map.
+fn set_degree(nodes: &mut [Map<String, Value>], edges: &[Map<String, Value>]) {
+    use std::collections::HashMap;
+    let mut deg: HashMap<String, i64> = HashMap::new();
+    for e in edges {
+        *deg.entry(display(e.get("from"))).or_insert(0) += 1;
+        *deg.entry(display(e.get("to"))).or_insert(0) += 1;
+    }
+    for n in nodes {
+        let id = display(n.get("id"));
+        n.insert("degree".into(), json!(deg.get(&id).copied().unwrap_or(0)));
+    }
+}
+
+/// Deterministic label propagation (the backend runs networkx Louvain —
+/// impossible to reproduce id-for-id, so the goal here is *stability*: same
+/// tables → same colouring, every run). Nodes iterate in sorted-id order,
+/// adopt the neighbour label with the highest summed edge weight (ties →
+/// smallest label), until stable; labels are then renumbered densely in
+/// first-appearance order over the sorted ids.
+fn assign_communities(nodes: &mut [Map<String, Value>], edges: &[Map<String, Value>]) {
+    use std::collections::HashMap;
+    let mut ids: Vec<String> = nodes.iter().map(|n| display(n.get("id"))).collect();
+    ids.sort();
+    let index: HashMap<&str, usize> =
+        ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); ids.len()];
+    for e in edges {
+        let (a, b) = (display(e.get("from")), display(e.get("to")));
+        let (Some(&ia), Some(&ib)) = (index.get(a.as_str()), index.get(b.as_str())) else {
+            continue;
+        };
+        if ia == ib {
+            continue;
+        }
+        let w = e.get("confidence").and_then(Value::as_f64).unwrap_or(1.0);
+        adj[ia].push((ib, w));
+        adj[ib].push((ia, w));
+    }
+    let mut labels: Vec<usize> = (0..ids.len()).collect();
+    for _ in 0..50 {
+        let mut changed = false;
+        for i in 0..ids.len() {
+            if adj[i].is_empty() {
+                continue;
+            }
+            let mut weights: HashMap<usize, f64> = HashMap::new();
+            for &(j, w) in &adj[i] {
+                *weights.entry(labels[j]).or_insert(0.0) += w;
+            }
+            let best = weights
+                .into_iter()
+                .max_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // ties → smallest label wins, deterministically
+                        .then(b.0.cmp(&a.0))
+                })
+                .map(|(l, _)| l);
+            if let Some(l) = best {
+                if l != labels[i] {
+                    labels[i] = l;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut dense: HashMap<usize, i64> = HashMap::new();
+    let mut next = 0i64;
+    let by_id: HashMap<&str, i64> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let c = *dense.entry(labels[i]).or_insert_with(|| {
+                let v = next;
+                next += 1;
+                v
+            });
+            (id.as_str(), c)
+        })
+        .collect();
+    for n in nodes {
+        let id = display(n.get("id"));
+        n.insert(
+            "community_id".into(),
+            by_id.get(id.as_str()).map(|c| json!(c)).unwrap_or(Value::Null),
+        );
+    }
+}
+
 pub fn read_snapshot(conn: &Connection) -> Result<Value, CoreError> {
     let projects = query_rows(conn, PROJECTS_SQL, &[])?;
     let mut states = Map::new();
@@ -394,6 +700,7 @@ pub fn read_snapshot(conn: &Connection) -> Result<Value, CoreError> {
         "devices": devices(conn)?,
         "pending_tasks": pending_tasks(conn)?,
         "pending_relations": pending_relations(conn)?,
+        "graph": graph(conn)?,
     }))
 }
 
@@ -450,6 +757,82 @@ mod tests {
         // Parity with sql::connect(): the backend's soft-link patterns rely on OFF.
         conn.pragma_update(None, "foreign_keys", false).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn snapshot_serves_the_map_graph() {
+        let (_dir, conn) = setup();
+        conn.execute(
+            "INSERT INTO entities (id, canonical_name, type, status, memory_strength) VALUES \
+             ('e1', 'Alexis', 'person', 'active', 1.0), \
+             ('e2', 'Arkose', 'organization', 'active', 0.8), \
+             ('e3', 'Lyon', 'place', 'active', 0.5), \
+             ('e4', 'Fantôme', 'person', 'archived', 0.1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE entities SET archived_at = CURRENT_TIMESTAMP WHERE id = 'e4'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relations (id, entity_from, predicate, entity_to, confidence, review_status) VALUES \
+             ('r1', 'e1', 'climbs_at', 'e2', 0.9, 'confirmed'), \
+             ('r2', 'e1', 'maybe_knows', 'e3', 0.4, 'pending')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO atomic_notes (id, content, kind, entities_mentioned) VALUES \
+             ('n1', 'séance de bloc avec Alexis', 'note', '[\"Alexis\"]'), \
+             ('n2', 'digest de la semaine', 'digest', '[\"Alexis\",\"Arkose\"]')",
+            [],
+        )
+        .unwrap();
+
+        let g = graph(&conn).unwrap();
+        let nodes = g["nodes"].as_array().unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        // Archived entity and digest note are hidden; the note rides as n:<id>.
+        assert!(ids.contains(&"e1") && ids.contains(&"e2") && ids.contains(&"e3"));
+        assert!(!ids.contains(&"e4"));
+        assert!(ids.contains(&"n:n1"));
+        assert!(!ids.iter().any(|i| i.contains("n2")));
+
+        // Edges: the confirmed relation + the resolved mention; pending hidden.
+        let edges = g["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|e| e["from"] == "e1"
+            && e["to"] == "e2"
+            && e["label"] == "climbs_at"));
+        assert!(edges.iter().any(|e| e["from"] == "n:n1"
+            && e["to"] == "e1"
+            && e["label"] == "mentions"));
+
+        // Degrees follow the surviving edges; connected nodes share one
+        // community, the isolated one sits alone; note nodes carry the shape.
+        let by_id = |id: &str| nodes.iter().find(|n| n["id"] == id).unwrap();
+        assert_eq!(by_id("e1")["degree"], 2);
+        assert_eq!(by_id("e2")["degree"], 1);
+        assert_eq!(by_id("e3")["degree"], 0);
+        assert_eq!(by_id("e1")["community_id"], by_id("e2")["community_id"]);
+        assert_eq!(by_id("e1")["community_id"], by_id("n:n1")["community_id"]);
+        assert_ne!(by_id("e3")["community_id"], by_id("e1")["community_id"]);
+        assert_eq!(by_id("e1")["kind"], "entity");
+        assert_eq!(by_id("n:n1")["kind"], "atomic_note");
+        assert_eq!(by_id("n:n1")["type"], "atomic_note");
+
+        // Clusters: only the ≥3-member community becomes a coloured region,
+        // labelled by its most salient entity (no Haiku offline).
+        let clusters = g["clusters"].as_array().unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0]["community_id"], by_id("e1")["community_id"]);
+        assert_eq!(clusters[0]["label"], "Alexis");
+        assert_eq!(clusters[0]["size"], 3);
+
+        // Deterministic: a second render colours identically.
+        assert_eq!(graph(&conn).unwrap(), g);
     }
 
     #[test]
