@@ -74,6 +74,9 @@ pub fn apply_action(
         "confirm_note" => confirm_pending(conn, "atomic_notes", s(p, "noteId")),
         "confirm_relation" => confirm_pending(conn, "relations", s(p, "relationId")),
         "requeue_capture" => requeue_capture(conn, s(p, "captureId")),
+        "attach_entry" => attach_entry(conn, p),
+        "detach_entry" => detach_entry(conn, s(p, "entryId")),
+        "reclassify_entry_as_fact" => reclassify_entry_as_fact(conn, p),
         other => Err(CoreError::Storage(format!("unknown action type '{other}'"))),
     }
 }
@@ -853,6 +856,133 @@ fn requeue_capture(conn: &Connection, id: &str) -> Result<Value, CoreError> {
     }
 }
 
+// ── project entries (SYN-144) ────────────────────────────────────────────────
+// Mirrors of `POST /project-entries/{id}/attach-to-project|detach|
+// reclassify-as-fact` (SYN-45/55): the projection moves, the immutable inbox
+// capture is never touched. HTTP 400/404/409 guards become Ok statuses.
+
+/// `capture_id` like Python's `str()` — TEXT uuid since SYN-112, but legacy
+/// rows may still carry the historical integer form.
+fn value_to_string(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Port of `app.py::attach_entry_to_project`: additive parallel rattachement —
+/// INSERT a sibling entry on the target project, the source row stays. Unlike
+/// the backend endpoint, the outcome carries a `synthesis` job so the new
+/// entry reaches the target's living prose (host post-commit, SYN-135 patron).
+fn attach_entry(conn: &Connection, p: &Map<String, Value>) -> Result<Value, CoreError> {
+    let project_id = s(p, "projectId");
+    let src = query_row_map(
+        conn,
+        "SELECT id, project_id, capture_id, content, kind FROM project_entries WHERE id = ?1",
+        &[SqlV::from(s(p, "entryId").to_string())],
+    )?;
+    let Some(src) = src else {
+        return not_found();
+    };
+    if src.get("project_id").and_then(Value::as_str) == Some(project_id) {
+        return ok("already_attached");
+    }
+    let target = query_row_map(
+        conn,
+        "SELECT id, canonical_name FROM entities WHERE id = ?1 AND type = 'project'",
+        &[SqlV::from(project_id.to_string())],
+    )?;
+    let Some(target) = target else {
+        return ok("target_not_found");
+    };
+    let capture_id = value_to_string(src.get("capture_id"));
+    let dup: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM project_entries WHERE project_id = ?1 AND capture_id = ?2",
+        params![project_id, capture_id],
+        |r| r.get(0),
+    )?;
+    if dup > 0 {
+        return ok("skipped");
+    }
+    let content = src.get("content").and_then(Value::as_str).unwrap_or("");
+    let new_id = new_uuid();
+    conn.execute(
+        "INSERT INTO project_entries (id, project_id, capture_id, content, kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            new_id,
+            project_id,
+            capture_id,
+            content,
+            src.get("kind").and_then(Value::as_str).unwrap_or("note")
+        ],
+    )?;
+    let entry_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM project_entries WHERE project_id = ?1",
+        params![project_id],
+        |r| r.get(0),
+    )?;
+    Ok(json!({
+        "status": "attached",
+        "new_entry_id": new_id,
+        "synthesis": {
+            "project_id": project_id,
+            "project_name": target.get("canonical_name").and_then(Value::as_str).unwrap_or(""),
+            "entry_id": new_id,
+            "entry_content": content,
+            "entry_count": entry_count,
+        },
+    }))
+}
+
+/// Port of `app.py::detach_project_entry`: the projection is destroyed, the
+/// source-of-truth capture stays in inbox.
+fn detach_entry(conn: &Connection, entry_id: &str) -> Result<Value, CoreError> {
+    let n = conn.execute("DELETE FROM project_entries WHERE id = ?1", params![entry_id])?;
+    if n == 0 {
+        return not_found();
+    }
+    ok("detached")
+}
+
+/// Port of `app.py::reclassify_entry_as_fact`: the entry becomes an explicit
+/// fact on the target entity (confidence 1.0 — the user vouches for it),
+/// provenance kept, the projection row deleted. `insert_fact` marks the
+/// entity `summary_stale` (SYN-89) so the prose replays at the next cycle.
+fn reclassify_entry_as_fact(conn: &Connection, p: &Map<String, Value>) -> Result<Value, CoreError> {
+    let entry_id = s(p, "entryId");
+    let entity_id = s(p, "entityId");
+    let entry = query_row_map(
+        conn,
+        "SELECT id, capture_id FROM project_entries WHERE id = ?1",
+        &[SqlV::from(entry_id.to_string())],
+    )?;
+    let Some(entry) = entry else {
+        return not_found();
+    };
+    if !row_exists(conn, "entities", entity_id)? {
+        return ok("entity_not_found");
+    }
+    let capture_id = value_to_string(entry.get("capture_id"));
+    let persistence = opt(p, "persistenceValue")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(3);
+    let fact_id = insert_fact(
+        conn,
+        entity_id,
+        s(p, "predicate"),
+        Value::String(s(p, "value").to_string()),
+        1.0,
+        Value::String(capture_id.clone()),
+        persistence,
+        Some(capture_id).filter(|c| !c.is_empty()),
+        Value::Null,
+    )?;
+    conn.execute("DELETE FROM project_entries WHERE id = ?1", params![entry_id])?;
+    Ok(json!({ "status": "reclassified", "fact_id": fact_id }))
+}
+
 // ── space + devices (SYN-139) ────────────────────────────────────────────────
 // Mirrors of `PATCH /space` and `PATCH /device/{id}`. The HTTP guards (422 on
 // blank name, 409 on self-revoke / revoking the weaver) become Ok statuses
@@ -1003,6 +1133,96 @@ mod tests {
         assert_eq!(apply(&conn, "requeue_capture", json!({"captureId": "c1"}))["status"], "skipped");
         assert_eq!(
             apply(&conn, "requeue_capture", json!({"captureId": "ghost"}))["status"],
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn project_entry_actions_mirror_the_backend() {
+        let (_dir, conn) = setup();
+        conn.execute(
+            "INSERT INTO entities (id, canonical_name, type) VALUES \
+             ('p1', 'Rénovation', 'project'), ('p2', 'Jardin', 'project'), ('e1', 'Alexis', 'person')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_entries (id, project_id, capture_id, content, kind) VALUES \
+             ('pe1', 'p1', 'c1', 'poser le carrelage', 'note'), \
+             ('pe2', 'p1', 'c2', 'tailler la haie', 'note'), \
+             ('pe3', 'p1', 'c3', 'budget total 15000', 'note')",
+            [],
+        )
+        .unwrap();
+
+        // Attach = additive sibling on the target, with a synthesis job for the host.
+        let r = apply(&conn, "attach_entry", json!({"entryId": "pe1", "projectId": "p2"}));
+        assert_eq!(r["status"], "attached");
+        assert_eq!(r["synthesis"]["project_id"], "p2");
+        assert_eq!(r["synthesis"]["project_name"], "Jardin");
+        assert_eq!(r["synthesis"]["entry_count"], 1);
+        let siblings: i64 =
+            one(&conn, "SELECT COUNT(*) FROM project_entries WHERE capture_id = ?1", "c1");
+        assert_eq!(siblings, 2); // source row intact
+        // Replays and guards never wedge the queue.
+        assert_eq!(
+            apply(&conn, "attach_entry", json!({"entryId": "pe1", "projectId": "p2"}))["status"],
+            "skipped" // capture already attached there (backend 409)
+        );
+        assert_eq!(
+            apply(&conn, "attach_entry", json!({"entryId": "pe1", "projectId": "p1"}))["status"],
+            "already_attached" // backend 400
+        );
+        assert_eq!(
+            apply(&conn, "attach_entry", json!({"entryId": "pe1", "projectId": "e1"}))["status"],
+            "target_not_found" // not a project (backend 404)
+        );
+        assert_eq!(
+            apply(&conn, "attach_entry", json!({"entryId": "ghost", "projectId": "p2"}))["status"],
+            "not_found"
+        );
+
+        // Detach destroys the projection only.
+        assert_eq!(apply(&conn, "detach_entry", json!({"entryId": "pe2"}))["status"], "detached");
+        let left: i64 = one(&conn, "SELECT COUNT(*) FROM project_entries WHERE id = ?1", "pe2");
+        assert_eq!(left, 0);
+        assert_eq!(apply(&conn, "detach_entry", json!({"entryId": "pe2"}))["status"], "not_found");
+
+        // Reclassify = user-vouched fact + entry removed + stale summary.
+        assert_eq!(
+            apply(
+                &conn,
+                "reclassify_entry_as_fact",
+                json!({"entryId": "pe3", "entityId": "ghost", "predicate": "budget_total", "value": "15000"})
+            )["status"],
+            "entity_not_found"
+        );
+        let r = apply(
+            &conn,
+            "reclassify_entry_as_fact",
+            json!({"entryId": "pe3", "entityId": "e1", "predicate": "budget_total", "value": "15000"}),
+        );
+        assert_eq!(r["status"], "reclassified");
+        let fact_id = r["fact_id"].as_str().unwrap().to_string();
+        let (conf, prov): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT confidence, provenance_capture_id FROM facts WHERE id = ?1",
+                params![fact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(conf, 1.0);
+        assert_eq!(prov.as_deref(), Some("c3"));
+        let stale: i64 = one(&conn, "SELECT summary_stale FROM entities WHERE id = ?1", "e1");
+        assert_eq!(stale, 1);
+        let left: i64 = one(&conn, "SELECT COUNT(*) FROM project_entries WHERE id = ?1", "pe3");
+        assert_eq!(left, 0);
+        assert_eq!(
+            apply(
+                &conn,
+                "reclassify_entry_as_fact",
+                json!({"entryId": "pe3", "entityId": "e1", "predicate": "budget_total", "value": "15000"})
+            )["status"],
             "not_found"
         );
     }
