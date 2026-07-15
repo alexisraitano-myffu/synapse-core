@@ -30,7 +30,9 @@
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::embedder::CoreError;
@@ -199,13 +201,14 @@ pub fn accept(offer: &PairingOffer) -> Result<([u8; 32], [u8; 32]), CoreError> {
     Ok((accept_pub, key))
 }
 
-/// AEAD-seal `plaintext` under the channel key, binding both public keys as
-/// AAD. Output = nonce ‖ ciphertext, base64. Called by the payload holder
-/// ONLY after the user approves the join.
+/// AEAD-seal `plaintext` under the channel key, binding both handshake
+/// messages as AAD (X25519 public keys for the QR channel, SPAKE2 messages
+/// for the code channel — SYN-137). Output = nonce ‖ ciphertext, base64.
+/// Called by the payload holder ONLY after the user approves the join.
 pub fn seal(
     channel_key: &[u8; 32],
-    offer_pub: &[u8; 32],
-    accept_pub: &[u8; 32],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
     plaintext: &[u8],
 ) -> Result<String, CoreError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(channel_key));
@@ -233,8 +236,8 @@ pub fn seal(
 /// which is exactly what a MITM without the QR secret ends up with.
 pub fn open(
     channel_key: &[u8; 32],
-    offer_pub: &[u8; 32],
-    accept_pub: &[u8; 32],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
     sealed_b64: &str,
 ) -> Result<Vec<u8>, CoreError> {
     let raw = unb64(sealed_b64)?;
@@ -250,6 +253,81 @@ pub fn open(
             Payload { msg: ct, aad: &ad },
         )
         .map_err(|_| CoreError::Storage("pairing: open failed (wrong channel / tampered)".into()))
+}
+
+// ── code pairing (SYN-137) — Mac↔Mac, no camera ──────────────────────────────
+//
+// A 6-digit code cannot ride the QR scheme above: mixed into HKDF it would be
+// offline-brute-forceable (10^6 tries against one observed exchange). SPAKE2
+// makes the code safe by construction — each guess requires a fresh ACTIVE
+// handshake with the member, who counts and caps the attempts. A wrong code
+// does not error inside SPAKE2: both sides simply derive different keys, so
+// the joiner proves knowledge with a key-confirmation MAC over the transcript
+// before the request may enter the human-approval queue. The payload transfer
+// then reuses `seal`/`open` with the two SPAKE2 messages as AAD.
+//
+// Never log the code, the messages or the derived key.
+
+const CODE_IDENTITY: &[u8] = b"synapse-pair-code-v1";
+const CONFIRM_INFO: &[u8] = b"synapse-pair-code-confirm-v1";
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// One side of the PAKE on the short code (symmetric — member and joiner run
+/// the same role). Keep it between sending our message and receiving the
+/// peer's; `finish` consumes it (SPAKE2 states are one-shot).
+pub struct CodePairing {
+    state: Spake2<Ed25519Group>,
+}
+
+impl CodePairing {
+    /// Start the handshake on `code`. Returns the session and our message
+    /// (~33 bytes) to send to the peer.
+    pub fn start(code: &str) -> (Self, Vec<u8>) {
+        let (state, msg) = Spake2::<Ed25519Group>::start_symmetric(
+            &Password::new(code.as_bytes()),
+            &Identity::new(CODE_IDENTITY),
+        );
+        (Self { state }, msg)
+    }
+
+    /// Complete with the peer's message → the 32-byte channel key. With a
+    /// wrong code this still SUCCEEDS but yields a different key — detect it
+    /// with [`code_confirm_mac`]/[`code_confirm_verify`].
+    pub fn finish(self, peer_msg: &[u8]) -> Result<[u8; 32], CoreError> {
+        let key = self
+            .state
+            .finish(peer_msg)
+            .map_err(|_| CoreError::Storage("pairing: code handshake failed".into()))?;
+        key.as_slice()
+            .try_into()
+            .map_err(|_| CoreError::Storage("pairing: bad code key length".into()))
+    }
+}
+
+/// Joiner side: key-confirmation MAC over the transcript (member msg first),
+/// proving — one online attempt at a time — that the joiner knew the code.
+pub fn code_confirm_mac(key: &[u8; 32], member_msg: &[u8], joiner_msg: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(CONFIRM_INFO);
+    mac.update(member_msg);
+    mac.update(joiner_msg);
+    mac.finalize().into_bytes().into()
+}
+
+/// Member side: constant-time verification of the joiner's confirmation MAC.
+/// A mismatch burns one attempt; the caller caps them.
+pub fn code_confirm_verify(
+    key: &[u8; 32],
+    member_msg: &[u8],
+    joiner_msg: &[u8],
+    mac_bytes: &[u8],
+) -> bool {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(CONFIRM_INFO);
+    mac.update(member_msg);
+    mac.update(joiner_msg);
+    mac.verify_slice(mac_bytes).is_ok()
 }
 
 #[cfg(test)]
@@ -344,5 +422,56 @@ mod tests {
         let (_s2, o2) = PairingSession::offer(vec![]).unwrap();
         assert_ne!(o1.secret, o2.secret);
         assert_ne!(o1.offer_pub, o2.offer_pub);
+    }
+
+    /// SYN-137 happy path: same code → same key, MAC confirms, seal/open
+    /// round-trips the payload with the SPAKE2 messages as AAD.
+    #[test]
+    fn code_pairing_same_code_transfers_payload() {
+        let (member, msg_m) = CodePairing::start("483921");
+        let (joiner, msg_j) = CodePairing::start("483921");
+        let key_m = member.finish(&msg_j).unwrap();
+        let key_j = joiner.finish(&msg_m).unwrap();
+        assert_eq!(key_m, key_j, "same code, same transcript → one key");
+
+        let mac = code_confirm_mac(&key_j, &msg_m, &msg_j);
+        assert!(code_confirm_verify(&key_m, &msg_m, &msg_j, &mac));
+
+        let payload = br#"{"space_id":"uuid-s","token":"secret"}"#;
+        let sealed = seal(&key_m, &msg_m, &msg_j, payload).unwrap();
+        assert_eq!(open(&key_j, &msg_m, &msg_j, &sealed).unwrap(), payload);
+    }
+
+    /// A wrong code never errors inside SPAKE2 — it yields a different key.
+    /// The confirmation MAC is what catches it (and the AEAD stays shut).
+    #[test]
+    fn code_pairing_wrong_code_fails_confirmation_and_open() {
+        let (member, msg_m) = CodePairing::start("483921");
+        let (guesser, msg_g) = CodePairing::start("000000");
+        let key_m = member.finish(&msg_g).unwrap();
+        let key_g = guesser.finish(&msg_m).unwrap();
+        assert_ne!(key_m, key_g);
+
+        let mac = code_confirm_mac(&key_g, &msg_m, &msg_g);
+        assert!(
+            !code_confirm_verify(&key_m, &msg_m, &msg_g, &mac),
+            "a guessed code must not pass confirmation"
+        );
+
+        let sealed = seal(&key_m, &msg_m, &msg_g, b"payload").unwrap();
+        assert!(open(&key_g, &msg_m, &msg_g, &sealed).is_err());
+    }
+
+    /// The MAC binds the transcript: swapping messages or truncating rejects.
+    #[test]
+    fn code_confirmation_binds_the_transcript() {
+        let (member, msg_m) = CodePairing::start("112233");
+        let (joiner, msg_j) = CodePairing::start("112233");
+        let key = member.finish(&msg_j).unwrap();
+        let _ = joiner;
+
+        let mac = code_confirm_mac(&key, &msg_m, &msg_j);
+        assert!(!code_confirm_verify(&key, &msg_j, &msg_m, &mac), "order matters");
+        assert!(!code_confirm_verify(&key, &msg_m, &msg_j, &mac[..16]), "no truncation");
     }
 }

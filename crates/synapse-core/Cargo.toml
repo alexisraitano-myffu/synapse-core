@@ -36,6 +36,11 @@ hkdf = "0.12"
 sha2 = "0.10"
 getrandom = "0.2"
 base64ct = { version = "1", features = ["alloc"] }
+# SYN-137 Mac↔Mac pairing: PAKE on the 6-digit code (offline brute-force
+# impossible by construction) + HMAC key confirmation so the member can
+# count and cap online attempts.
+spake2 = "0.4"
+hmac = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
