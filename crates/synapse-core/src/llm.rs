@@ -146,22 +146,35 @@ pub(crate) fn response_text(body: &Value) -> String {
         .to_string()
 }
 
-/// Extra attempts granted to a generative call that came back empty.
+/// Extra attempts granted to a generative call that came back unusable.
 const EMPTY_RETRIES: usize = 1;
 
-/// `post_messages` + `response_text`, retried when the model returns empty
-/// text. Small local models occasionally emit nothing at all for an otherwise
-/// valid prompt (observed once on Gemma E4B during the SYN-124 bench, on an
-/// entity re-summary); a bare retry recovers it. Callers keep the same
-/// contract as `response_text` — an empty string is still possible once the
-/// retries are spent, and stays the caller's problem.
+/// True when a generative response can't be used as-is: no text at all, or
+/// truncated at `max_tokens` (a summary cut mid-sentence is not a summary).
+///
+/// SYN-124 — measured root cause: reasoning-capable models sometimes spend the
+/// whole budget on a thinking block and return `stop_reason = max_tokens` with
+/// an EMPTY body. On Gemma E4B re-summarising an entity, ~1000 chars of
+/// thinking consumed all 300 tokens; the same prompt succeeds on a retry when
+/// the model doesn't think. Retrying on emptiness alone caught that only by
+/// accident, and never caught a truncation that left partial text behind.
+fn unusable(body: &Value, text: &str) -> bool {
+    text.is_empty() || body["stop_reason"].as_str() == Some("max_tokens")
+}
+
+/// `post_messages` + `response_text`, retried while the response is unusable
+/// (see [`unusable`]). Callers keep the same contract as `response_text` — an
+/// empty string is still possible once the retries are spent, and stays the
+/// caller's problem.
 pub(crate) fn post_messages_text(config: &LlmConfig, params: &Value) -> Result<String, CoreError> {
-    let mut text = response_text(&post_messages(config, params)?);
+    let mut body = post_messages(config, params)?;
+    let mut text = response_text(&body);
     for _ in 0..EMPTY_RETRIES {
-        if !text.is_empty() {
+        if !unusable(&body, &text) {
             break;
         }
-        text = response_text(&post_messages(config, params)?);
+        body = post_messages(config, params)?;
+        text = response_text(&body);
     }
     Ok(text)
 }
@@ -392,6 +405,29 @@ mod tests {
 
     const EMPTY: &str = r#"{"content":[{"type":"text","text":"   "}]}"#;
     const FILLED: &str = r#"{"content":[{"type":"text","text":"une fiche"}]}"#;
+    /// The measured Gemma failure: budget spent thinking, body empty, cut at max_tokens.
+    const THOUGHT_AWAY: &str =
+        r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":""}]}"#;
+    /// Truncated but non-empty — a summary cut mid-sentence.
+    const CUT: &str =
+        r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"une fiche coup"}]}"#;
+
+    #[test]
+    fn thinking_that_ate_the_budget_is_retried() {
+        let (base, rx) = stub_server(vec![THOUGHT_AWAY, FILLED]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert_eq!(text, "une fiche");
+        assert_eq!(rx.iter().count(), 2);
+    }
+
+    #[test]
+    fn truncated_but_non_empty_is_also_retried() {
+        // The old empty-only guard let this through: partial text, silently stored.
+        let (base, rx) = stub_server(vec![CUT, FILLED]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert_eq!(text, "une fiche", "a summary cut mid-sentence is not a summary");
+        assert_eq!(rx.iter().count(), 2);
+    }
 
     #[test]
     fn empty_generation_is_retried_once() {
