@@ -85,6 +85,11 @@ lived episode never changes its nature. Pick EXACTLY ONE, first match wins:
    probably adopted a dog"). Also the default when nothing above applies (e.g. a pure reflection).
 Discriminator: does the sentence answer "what happened to me?" (→ episodic) or "what is true about
 X?" (→ fact)? First person + past action + a moment ⇒ episodic, ALWAYS.
+CLOSED SET — `input_type` accepts ONLY these four values, never any other. If you are tempted to
+answer "task", "note" or "event", those are `atomic_note_kind` values, a DIFFERENT field: keep
+`input_type` inside the closed set AND emit the atomic_note with its proper kind. Narrowing
+`input_type` NEVER suppresses an atomic_note, an entity or a fact — the routing rules below apply
+unchanged, in particular the HARD RULE that an action to do always yields kind="task".
 
 atomic_note rules:
 An atomic_note is a THOUGHT of the author that should be able to resurface later (insight, idea,
