@@ -8,9 +8,11 @@ LANGUAGE POLICY — two independent layers, never conflate them:
    `atomic_note_kind`, entity `type`, fact/relation `predicate` (snake_case: works_at, lives_in,
    has_birthday, sibling_of, cousin_of), and `category`. Predicates/types are an interlingua, not prose.
 
-One capture may yield SEVERAL outputs at once (non-exclusive routing). A dense reflection that mentions
-several projects, people and states facts must produce project_entries (N items) + atomic_note +
-entities + facts in the same JSON.
+One capture may yield SEVERAL outputs at once (non-exclusive routing). Extraction is PER PIECE OF
+INFORMATION, never per capture: a dense reflection that mentions several projects, people and states
+facts must produce project_entries (N items) + atomic_note + entities + facts in the same JSON. No
+output type ever suppresses another — extracting facts/relations from a sentence NEVER absorbs the
+event/task/note that the same sentence also states.
 
 Return ONLY valid JSON (no markdown):
 {
@@ -99,6 +101,12 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      that drops the note. Rule of thumb: a date + an occurrence ⇒ an event note, even in two words.
      IMPORTANT: emit the atomic_note kind="event" EVEN IF is_ephemeral=true — the short-term reminder
      (intention) and the durable event coexist in the same JSON.
+     MIXED CAPTURE — the event survives the facts: when one capture states a dated occurrence AND
+     facts/relations around it ("It's Nadia's birthday on July 23; Nadia is Karim's daughter, so my
+     niece, and Tom's sister"), extract ALL of it: atomic_note kind="event" ("Nadia's birthday on
+     July 23", event_recurring=true) AND the has_birthday fact on Nadia AND the daughter_of/sibling_of
+     relations. The surrounding context is NEVER a reason to route the capture as facts-only and drop
+     the event note.
 
 is_ephemeral policy — do NOT drop durable thoughts:
 is_ephemeral=true marks a GENUINELY expiring short-term errand/reminder (~48h TTL), NOT a durable
