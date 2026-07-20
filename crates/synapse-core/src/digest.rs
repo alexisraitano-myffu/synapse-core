@@ -19,7 +19,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use crate::embedder::CoreError;
-use crate::llm::{load_prompt, post_messages, response_text, LlmConfig};
+use crate::llm::{load_prompt, post_messages_text, LlmConfig};
 use crate::routing::{new_uuid, query_row_maps, Brain};
 
 // Bounds so a busy week doesn't blow up the prompt — the digest is a summary,
@@ -261,15 +261,15 @@ impl Brain {
         let week_start = week["week_start"].as_str().unwrap_or("");
         let params_json = json!({
             "model": config.model,
-            "max_tokens": 1400,
+            // SYN-124 — markdown long + marge de raisonnement, cf. summaries::resummarize.
+            "max_tokens": 3072,
             "system": system,
             "messages": [{"role": "user", "content": format!(
                 "Matière de la semaine (semaine du {week_start}) :\n\n{payload}")}],
         });
-        let body = post_messages(config, &params_json)?;
-        let text = response_text(&body);
+        let text = post_messages_text(config, &params_json)?;
         if text.is_empty() {
-            return Err(CoreError::LlmContent("digest: réponse Haiku vide".into()));
+            return Err(CoreError::LlmContent("digest: réponse du modèle vide".into()));
         }
         Ok(text)
     }

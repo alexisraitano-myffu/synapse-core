@@ -62,6 +62,37 @@ Return ONLY valid JSON (no markdown):
   "classification_confidence": 1.0
 }
 
+input_type rules — the capture's NATURE, not its routing:
+input_type says WHAT THE CAPTURE IS. It is ORTHOGONAL to atomic_note / is_ephemeral / entities: a
+capture can be `episodic` AND yield facts, entities and project_entries — extracting facts FROM a
+lived episode never changes its nature. Pick EXACTLY ONE, first match wins:
+ - "resource": the capture centers on an external link/document to ingest (URL, article, video,
+   paper), even when the author comments on it.
+ - "ephemeral": a trivial expiring errand with NO durable content and no addressee, commitment or
+   date ("buy bread"; FR: "acheter du pain"). Mirrors is_ephemeral=true with atomic_note=null.
+ - "episodic": the AUTHOR recounts something THEY did, lived or experienced — first person, a moment
+   in time, routine or not, with or without an outcome. "I climbed with Alexis today and sent my
+   6b+", "went for a run this morning, felt good", "I worked on Synapse today" (FR: "j'ai été
+   escalader…", "j'ai mangé chez Léa hier").
+   HARD RULE — "I did / ate / saw / went / worked on / tried X" (first person + past lived action)
+   is ALWAYS input_type="episodic", NEVER "fact", even when the sentence also asserts something true
+   ("and I succeeded", "it went well") and even when it produces facts or project_entries. A lived
+   episode is not durable knowledge about the world: it belongs to the author's timeline.
+   The action must be ALREADY LIVED. First person alone is not enough: an intention, an obligation
+   or a plan ("I have to prepare the demo", "I need to call X", "I'm going to learn Japanese";
+   FR: "je dois préparer…", "je veux apprendre…") has not happened yet — it is NOT episodic. Route
+   it on its own merits (task / project), and leave input_type="fact".
+ - "fact": durable state asserted about someone/something ELSE, with no lived-episode framing
+   ("Marie has a cat named Gipsy", "Pierre works at Acme", "Audric is Alexis's cousin", "Léa
+   probably adopted a dog"). Also the default when nothing above applies (e.g. a pure reflection).
+Discriminator: does the sentence answer "what happened to me?" (→ episodic) or "what is true about
+X?" (→ fact)? First person + past action + a moment ⇒ episodic, ALWAYS.
+CLOSED SET — `input_type` accepts ONLY these four values, never any other. If you are tempted to
+answer "task", "note" or "event", those are `atomic_note_kind` values, a DIFFERENT field: keep
+`input_type` inside the closed set AND emit the atomic_note with its proper kind. Narrowing
+`input_type` NEVER suppresses an atomic_note, an entity or a fact — the routing rules below apply
+unchanged, in particular the HARD RULE that an action to do always yields kind="task".
+
 atomic_note rules:
 An atomic_note is a THOUGHT of the author that should be able to resurface later (insight, idea,
 striking quote, decision). It is NOT a report of a routine event nor a factual assertion about others.
@@ -117,8 +148,8 @@ A kind="note" reflection must NEVER be marked is_ephemeral=true (it would be sil
 Otherwise atomic_note = null. In particular, atomic_note = null for ALL these cases:
  - "X has/is/does Y" → fact about X ("Karim has a project called Atlas", "Marie has a cat Gipsy",
    "Léa probably adopted a dog", "my mother has a new cat").
- - "I did/ate/saw/worked on …" → routine event, goes to inbox + entities/facts, not atomic_note
-   (unless the author explicitly draws a reflection from it, cf. (a)).
+ - "I did/ate/saw/worked on …" → lived episode (input_type="episodic"), goes to inbox +
+   entities/facts, not atomic_note (unless the author explicitly draws a reflection from it, cf. (a)).
  - Project progress report ("I made progress on X today, tested Y") → project_entries, not atomic_note
    (unless an explicit reflection is added).
  - Trivial micro-errand, WITHOUT an addressee or stakes, WITHOUT durable content or a date ("I need to

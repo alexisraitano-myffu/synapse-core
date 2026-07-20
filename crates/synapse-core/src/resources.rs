@@ -18,7 +18,7 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 
 use crate::embedder::CoreError;
-use crate::llm::{load_prompt, post_messages, response_text, LlmConfig};
+use crate::llm::{load_prompt, post_messages_text, LlmConfig};
 use crate::routing::{new_uuid, Brain};
 
 const SKIP_TAGS: [&str; 8] =
@@ -283,20 +283,15 @@ fn summarize(config: Option<&LlmConfig>, title: &str, text: &str) -> String {
     let head: String = text.chars().take(8000).collect();
     let params_json = json!({
         "model": config.model,
-        "max_tokens": 300,
+        // SYN-124 — 2-4 phrases demandées + marge de raisonnement, cf. summaries::resummarize.
+        "max_tokens": 1024,
         "system": system,
         "messages": [{"role": "user", "content": format!("Titre : {title}\n\n{head}")}],
     });
-    match post_messages(config, &params_json) {
-        Ok(body) => {
-            let t = response_text(&body);
-            if t.is_empty() {
-                snippet
-            } else {
-                t
-            }
-        }
-        Err(_) => snippet,
+    match post_messages_text(config, &params_json) {
+        // Still empty after the retry — fall back to the extracted snippet.
+        Ok(t) if !t.is_empty() => t,
+        _ => snippet,
     }
 }
 

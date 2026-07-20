@@ -146,6 +146,39 @@ pub(crate) fn response_text(body: &Value) -> String {
         .to_string()
 }
 
+/// Extra attempts granted to a generative call that came back unusable.
+const EMPTY_RETRIES: usize = 1;
+
+/// True when a generative response can't be used as-is: no text at all, or
+/// truncated at `max_tokens` (a summary cut mid-sentence is not a summary).
+///
+/// SYN-124 — measured root cause: reasoning-capable models sometimes spend the
+/// whole budget on a thinking block and return `stop_reason = max_tokens` with
+/// an EMPTY body. On Gemma E4B re-summarising an entity, ~1000 chars of
+/// thinking consumed all 300 tokens; the same prompt succeeds on a retry when
+/// the model doesn't think. Retrying on emptiness alone caught that only by
+/// accident, and never caught a truncation that left partial text behind.
+fn unusable(body: &Value, text: &str) -> bool {
+    text.is_empty() || body["stop_reason"].as_str() == Some("max_tokens")
+}
+
+/// `post_messages` + `response_text`, retried while the response is unusable
+/// (see [`unusable`]). Callers keep the same contract as `response_text` — an
+/// empty string is still possible once the retries are spent, and stays the
+/// caller's problem.
+pub(crate) fn post_messages_text(config: &LlmConfig, params: &Value) -> Result<String, CoreError> {
+    let mut body = post_messages(config, params)?;
+    let mut text = response_text(&body);
+    for _ in 0..EMPTY_RETRIES {
+        if !unusable(&body, &text) {
+            break;
+        }
+        body = post_messages(config, params)?;
+        text = response_text(&body);
+    }
+    Ok(text)
+}
+
 /// Read a prompt file from `prompts_dir`, dropping the trailing newline so
 /// the text stays byte-identical to the historical Python constants.
 pub(crate) fn load_prompt(prompts_dir: &str, file: &str) -> Result<String, CoreError> {
@@ -303,6 +336,124 @@ fn owner_entity_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal one-shot /v1/messages stub: serves `bodies` in order, one per
+    /// connection, and reports how many requests it actually received. Keeps
+    /// the retry test dependency-free (no HTTP mocking crate).
+    fn stub_server(bodies: Vec<&'static str>) -> (String, std::sync::mpsc::Receiver<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (i, mut stream) in listener.incoming().flatten().enumerate() {
+                // Read the FULL request (headers + body) before answering:
+                // closing a socket with unread input sends an RST, which the
+                // client reports as "connection reset" instead of our response.
+                let mut req: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let Some(head_end) = req
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                    else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&req[..head_end]).to_lowercase();
+                    let want: usize = head
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|s| s.split("\r\n").next())
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    if req.len() - head_end >= want {
+                        break;
+                    }
+                }
+                let payload = bodies.get(i).copied().unwrap_or("{}");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = tx.send(());
+                if i + 1 >= bodies.len() {
+                    break;
+                }
+            }
+        });
+        (base, rx)
+    }
+
+    fn cfg(base: String) -> LlmConfig {
+        LlmConfig {
+            model: "test".into(),
+            api_key: "k".into(),
+            base_url: Some(base),
+            fuel_token: None,
+            prompts_dir: String::new(),
+            today: "2026-07-20".into(),
+        }
+    }
+
+    const EMPTY: &str = r#"{"content":[{"type":"text","text":"   "}]}"#;
+    const FILLED: &str = r#"{"content":[{"type":"text","text":"une fiche"}]}"#;
+    /// The measured Gemma failure: budget spent thinking, body empty, cut at max_tokens.
+    const THOUGHT_AWAY: &str =
+        r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":""}]}"#;
+    /// Truncated but non-empty — a summary cut mid-sentence.
+    const CUT: &str =
+        r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"une fiche coup"}]}"#;
+
+    #[test]
+    fn thinking_that_ate_the_budget_is_retried() {
+        let (base, rx) = stub_server(vec![THOUGHT_AWAY, FILLED]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert_eq!(text, "une fiche");
+        assert_eq!(rx.iter().count(), 2);
+    }
+
+    #[test]
+    fn truncated_but_non_empty_is_also_retried() {
+        // The old empty-only guard let this through: partial text, silently stored.
+        let (base, rx) = stub_server(vec![CUT, FILLED]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert_eq!(text, "une fiche", "a summary cut mid-sentence is not a summary");
+        assert_eq!(rx.iter().count(), 2);
+    }
+
+    #[test]
+    fn empty_generation_is_retried_once() {
+        let (base, rx) = stub_server(vec![EMPTY, FILLED]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert_eq!(text, "une fiche", "the retry's text must win");
+        assert_eq!(rx.iter().count(), 2, "exactly one retry");
+    }
+
+    #[test]
+    fn non_empty_generation_is_not_retried() {
+        let (base, rx) = stub_server(vec![FILLED]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert_eq!(text, "une fiche");
+        assert_eq!(rx.iter().count(), 1, "no retry when the first call is useful");
+    }
+
+    #[test]
+    fn still_empty_after_retry_stays_empty_for_the_caller() {
+        // Contract: retries are bounded — callers still handle the empty case
+        // (summaries keeps summary_stale=1, resources falls back to a snippet).
+        let (base, rx) = stub_server(vec![EMPTY, EMPTY]);
+        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(rx.iter().count(), 2, "bounded at EMPTY_RETRIES, no loop");
+    }
 
     #[test]
     fn parse_strips_fences_and_guards_truncation() {

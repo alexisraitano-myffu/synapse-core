@@ -10,7 +10,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use crate::embedder::CoreError;
-use crate::llm::{load_prompt, post_messages, response_text, LlmConfig};
+use crate::llm::{load_prompt, post_messages_text, LlmConfig};
 use crate::routing::{
     entity_embedding_text, new_uuid, persist_project_entry, query_row_map, query_row_maps, Brain,
     ProjectSynthesis,
@@ -178,17 +178,23 @@ impl Brain {
 
             let params_json = json!({
                 "model": config.model,
-                "max_tokens": 300,
+                // SYN-124 — budget = sortie + marge pour un bloc de raisonnement. Un modèle
+                // qui « pense » dépense d'abord son budget en thinking : dimensionné pour la
+                // seule sortie, il rend une réponse vide tronquée à max_tokens (cas mesuré sur
+                // Gemma E4B). max_tokens est un plafond, pas une cible : relever ne coûte rien
+                // tant que le modèle ne génère pas plus.
+                "max_tokens": 1024,
                 "system": system_e,
                 "messages": [{"role": "user", "content": lines.join("\n")}],
             });
-            let body = match post_messages(config, &params_json) {
-                Ok(b) => b,
+            let summary = match post_messages_text(config, &params_json) {
+                Ok(t) => t,
                 // Infra failure — stop here; the stale flags survive.
                 Err(CoreError::LlmHttp(_)) => break,
                 Err(_) => continue,
             };
-            let summary = response_text(&body);
+            // Still empty after the retry: leave summary_stale = 1 so the next
+            // pass tries again rather than storing a blank fiche.
             if !summary.is_empty() {
                 conn.execute(
                     "UPDATE entities SET summary = ?1, summary_stale = 0 WHERE id = ?2",
@@ -337,14 +343,15 @@ fn append_project_summary(
 
     let params_json = json!({
         "model": config.model,
-        "max_tokens": 1024,
+        // SYN-124 — ~500 mots demandés + marge de raisonnement, cf. resummarize.
+        "max_tokens": 2048,
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": user_msg}],
     });
-    let Ok(body) = post_messages(config, &params_json) else {
+    let Ok(text) = post_messages_text(config, &params_json) else {
         return Ok(None);
     };
-    let summary_md = strip_fences(&response_text(&body));
+    let summary_md = strip_fences(&text);
 
     let version_id = new_uuid();
     conn.execute(
@@ -433,14 +440,15 @@ fn refine_project_summary(
 
     let params_json = json!({
         "model": config.model,
-        "max_tokens": 2048,
+        // SYN-124 — 500-800 mots demandés + marge de raisonnement, cf. resummarize.
+        "max_tokens": 3072,
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": user_msg}],
     });
-    let Ok(body) = post_messages(config, &params_json) else {
+    let Ok(text) = post_messages_text(config, &params_json) else {
         return Ok(None);
     };
-    let summary_md = strip_fences(&response_text(&body));
+    let summary_md = strip_fences(&text);
 
     let entry_count = entries.len() as i64;
     let version_id = new_uuid();
