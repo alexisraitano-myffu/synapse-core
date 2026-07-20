@@ -76,6 +76,10 @@ lived episode never changes its nature. Pick EXACTLY ONE, first match wins:
    is ALWAYS input_type="episodic", NEVER "fact", even when the sentence also asserts something true
    ("and I succeeded", "it went well") and even when it produces facts or project_entries. A lived
    episode is not durable knowledge about the world: it belongs to the author's timeline.
+   The action must be ALREADY LIVED. First person alone is not enough: an intention, an obligation
+   or a plan ("I have to prepare the demo", "I need to call X", "I'm going to learn Japanese";
+   FR: "je dois préparer…", "je veux apprendre…") has not happened yet — it is NOT episodic. Route
+   it on its own merits (task / project), and leave input_type="fact".
  - "fact": durable state asserted about someone/something ELSE, with no lived-episode framing
    ("Marie has a cat named Gipsy", "Pierre works at Acme", "Audric is Alexis's cousin", "Léa
    probably adopted a dog"). Also the default when nothing above applies (e.g. a pure reflection).
