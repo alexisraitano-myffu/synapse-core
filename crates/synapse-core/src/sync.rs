@@ -77,6 +77,8 @@ fn synced_tables() -> &'static [(&'static str, &'static str)] {
         ("entity_type_proposals", "id"),
         ("project_attach_proposals", "id"),
         ("sync_owner", "id"),
+        ("space", "id"),
+        ("devices", "device_id"),
     ]
 }
 
@@ -490,10 +492,18 @@ pub(crate) fn apply_changes(conn: &Connection, changes_json: &str) -> Result<Str
         }
         let n = tx.execute(&format!("DELETE FROM \"{tbl}\" WHERE \"{pkc}\" = ?1"), params![pk])?;
         if tbl == "atomic_notes" {
+            // Sweep every chunk key (`uuid` then `uuid#k`, SYN-118) — a
+            // replicated delete must not leave orphan chunk vectors behind.
             tx.execute(
                 "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
                 params![pk],
             )?;
+            for k in 1..crate::embedder::MAX_CHUNKS {
+                tx.execute(
+                    "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
+                    params![format!("{pk}#{k}")],
+                )?;
+            }
             note_touched(pk, &mut note_set, &mut notes_changed);
         }
         tx.execute(
@@ -673,6 +683,76 @@ pub(crate) fn apply_changes(conn: &Connection, changes_json: &str) -> Result<Str
     .to_string())
 }
 
+// ── Dedup of double-routed derived rows (SYN-133, post-merge safety net) ────
+
+/// (table, guard column that must be non-null, natural-identity columns).
+/// Mirror of `api/sync_peers.py::_DEDUP_RULES` — keep both in step.
+const DEDUP_RULES: &[(&str, &str, &[&str])] = &[
+    (
+        "atomic_notes",
+        "provenance_capture_id",
+        &["provenance_capture_id", "content", "kind"],
+    ),
+    (
+        "facts",
+        "provenance_capture_id",
+        &["entity_id", "predicate", "value", "provenance_capture_id"],
+    ),
+    (
+        "relations",
+        "provenance_capture_id",
+        &["entity_from", "predicate", "entity_to", "provenance_capture_id"],
+    ),
+    (
+        "project_entries",
+        "capture_id",
+        &["project_id", "capture_id", "content", "kind"],
+    ),
+];
+
+/// Port of `api/sync_peers.py::dedup_after_pull` — collapse rows that two
+/// devices derived from the same capture during a no-sync window (different
+/// uuids, same natural identity) onto the smallest uuid. Deletions journal as
+/// tombstones via the triggers → the collapse replicates to the whole mesh.
+/// Entities are NOT deduped here: the merge-proposal machinery (embedding
+/// similarity) already handles same-name entities gracefully.
+///
+/// Returns `(removed per table, doomed atomic_notes ids)` — the caller sweeps
+/// the doomed notes' vec0 rows (local, derived, never on the wire).
+pub(crate) fn dedup_after_pull(
+    conn: &Connection,
+) -> Result<(serde_json::Map<String, serde_json::Value>, Vec<String>), CoreError> {
+    let mut removed = serde_json::Map::new();
+    let mut doomed_notes: Vec<String> = Vec::new();
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for (table, guard, keys) in DEDUP_RULES {
+        let key_expr = keys.join(", ");
+        let doomed: Vec<String> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id FROM {table} WHERE {guard} IS NOT NULL \
+                 AND id NOT IN (SELECT min(id) FROM {table} \
+                                WHERE {guard} IS NOT NULL GROUP BY {key_expr})"
+            ))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        if doomed.is_empty() {
+            continue;
+        }
+        for id in &doomed {
+            tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
+        }
+        removed.insert((*table).to_string(), json!(doomed.len()));
+        if *table == "atomic_notes" {
+            doomed_notes = doomed;
+        }
+    }
+    tx.commit()?;
+    Ok((removed, doomed_notes))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -726,6 +806,63 @@ mod tests {
     }
 
     #[test]
+    fn dedup_collapses_twins_and_replicates_the_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = mem_store(&dir, "dedup-a.db");
+        let b = mem_store(&dir, "dedup-b.db");
+
+        // The same capture routed by two devices during a no-sync window:
+        // twin derived rows with different uuids, same natural identity.
+        exec(&a, "INSERT INTO inbox (id, content) VALUES ('c1', 'pensée')");
+        exec(&a, "INSERT INTO entities (id, canonical_name) VALUES ('e1', 'Léa')");
+        for (nid, fid, rid, pid) in [("n-b", "f-b", "r-b", "p-b"), ("n-a", "f-a", "r-a", "p-a")] {
+            exec(&a, &format!(
+                "INSERT INTO atomic_notes (id, content, kind, provenance_capture_id) \
+                 VALUES ('{nid}', 'pensée', 'note', 'c1')"));
+            exec(&a, &format!(
+                "INSERT INTO facts (id, entity_id, predicate, value, provenance_capture_id) \
+                 VALUES ('{fid}', 'e1', 'lives_in', 'Lyon', 'c1')"));
+            exec(&a, &format!(
+                "INSERT INTO relations (id, entity_from, predicate, entity_to, provenance_capture_id) \
+                 VALUES ('{rid}', 'e1', 'knows', 'e1', 'c1')"));
+            exec(&a, &format!(
+                "INSERT INTO project_entries (id, project_id, capture_id, content, kind) \
+                 VALUES ('{pid}', 'e1', 'c1', 'pensée', 'note')"));
+        }
+        // A distinct capture must survive untouched.
+        exec(&a, "INSERT INTO atomic_notes (id, content, kind, provenance_capture_id) \
+                  VALUES ('n-z', 'autre', 'note', 'c2')");
+        // One doomed note has (chunked) vectors — the sweep must clear them.
+        let blob: Vec<u8> = (0..384u32).flat_map(|_| 0.5f32.to_le_bytes()).collect();
+        a.upsert_note_vectors("n-b", &[blob.clone(), blob]).unwrap();
+
+        let report: Value =
+            serde_json::from_str(&a.dedup_after_pull().unwrap()).unwrap();
+        assert_eq!(report["removed"]["atomic_notes"], 1);
+        assert_eq!(report["removed"]["facts"], 1);
+        assert_eq!(report["removed"]["relations"], 1);
+        assert_eq!(report["removed"]["project_entries"], 1);
+        assert_eq!(report["doomed_notes"], serde_json::json!(["n-b"]));
+
+        // Smallest uuid survives; the distinct capture is intact.
+        assert_eq!(query_one(&a, "SELECT id FROM atomic_notes WHERE provenance_capture_id='c1'"), Some("n-a".into()));
+        assert_eq!(query_one(&a, "SELECT id FROM facts"), Some("f-a".into()));
+        assert_eq!(count(&a, "SELECT count(*) FROM atomic_notes"), 2);
+        assert_eq!(count(&a, "SELECT count(*) FROM atomic_notes_vec WHERE note_id LIKE 'n-b%'"), 0);
+
+        // Idempotent.
+        let again: Value = serde_json::from_str(&a.dedup_after_pull().unwrap()).unwrap();
+        assert_eq!(again["removed"], serde_json::json!({}));
+
+        // The collapse replicates: B gets the survivors AND the tombstones.
+        sync_once(&a, &b);
+        assert_eq!(count(&b, "SELECT count(*) FROM atomic_notes WHERE provenance_capture_id='c1'"), 1);
+        assert_eq!(query_one(&b, "SELECT id FROM facts"), Some("f-a".into()));
+        assert_eq!(count(&b, "SELECT count(*) FROM relations"), 1);
+        assert_eq!(count(&b, "SELECT count(*) FROM project_entries"), 1);
+    }
+
+    #[test]
     fn journal_captures_inserts_updates_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let s = mem_store(&dir, "a.db");
@@ -750,6 +887,48 @@ mod tests {
         assert_eq!(
             Some("-".to_string()),
             query_one(&s, "SELECT col FROM sync_log WHERE tbl='entities' AND pk='e1'")
+        );
+    }
+
+    #[test]
+    // SYN-127 — the space singleton and the device registry travel the mesh
+    // like any replicated table: a rename on one peer reaches the other.
+    #[test]
+    fn space_and_devices_replicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = mem_store(&dir, "a.db");
+        let b = mem_store(&dir, "b.db");
+
+        exec(
+            &a,
+            "INSERT INTO space (id, space_id, name) VALUES ('space', 'uuid-s', 'Ma mémoire')",
+        );
+        exec(
+            &a,
+            "INSERT INTO devices (device_id, name, platform, last_seen) \
+             VALUES ('dev-a', 'MacBook salon', 'macos', CURRENT_TIMESTAMP)",
+        );
+        sync_once(&a, &b);
+        assert_eq!(
+            Some("Ma mémoire".into()),
+            query_one(&b, "SELECT name FROM space WHERE id='space'")
+        );
+        assert_eq!(
+            Some("MacBook salon".into()),
+            query_one(&b, "SELECT name FROM devices WHERE device_id='dev-a'")
+        );
+
+        // Rename on b propagates back to a; revocation too.
+        exec(&b, "UPDATE devices SET name = 'Mac du salon' WHERE device_id = 'dev-a'");
+        exec(&b, "UPDATE devices SET revoked_at = CURRENT_TIMESTAMP WHERE device_id = 'dev-a'");
+        sync_once(&b, &a);
+        assert_eq!(
+            Some("Mac du salon".into()),
+            query_one(&a, "SELECT name FROM devices WHERE device_id='dev-a'")
+        );
+        assert_eq!(
+            1,
+            count(&a, "SELECT count(*) FROM devices WHERE device_id='dev-a' AND revoked_at IS NOT NULL")
         );
     }
 

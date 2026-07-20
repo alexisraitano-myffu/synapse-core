@@ -128,12 +128,42 @@ impl Brain {
         Some(vec.iter().flat_map(|x| x.to_le_bytes()).collect())
     }
 
+    /// One serialized vector per ~128-token window (SYN-118): the storage
+    /// keeps them all and search takes the best window per note.
+    pub(crate) fn embed_chunks(&self, text: &str) -> Option<Vec<Vec<u8>>> {
+        let chunks = self.embedder.as_ref()?.embed_chunks(text).ok()?;
+        Some(
+            chunks
+                .into_iter()
+                .map(|v| v.iter().flat_map(|x| x.to_le_bytes()).collect())
+                .collect(),
+        )
+    }
+
+    /// Chunk vectors concatenated into ONE blob (SYN-118) — the layout of the
+    /// `entities`/`resources` embedding columns; scorers take the best frame.
+    pub(crate) fn embed_frames(&self, text: &str) -> Option<Vec<u8>> {
+        Some(self.embed_chunks(text)?.concat())
+    }
+
     /// Embed arbitrary text with the Brain's already-loaded embedder — the
     /// host-side re-embed path after a sync apply (mirror of the backend's
     /// `embed_text`), without paying a second model load.
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, CoreError> {
         match &self.embedder {
             Some(e) => e.embed(text),
+            None => Err(CoreError::Embedding(
+                "brain opened without a model_dir".into(),
+            )),
+        }
+    }
+
+    /// Chunked variant (SYN-118) for the same re-embed path: one vector per
+    /// ~128-token window, so a mobile host stores the same per-chunk rows as
+    /// the desktop backend after a sync apply.
+    pub fn embed_text_chunks(&self, text: &str) -> Result<Vec<Vec<f32>>, CoreError> {
+        match &self.embedder {
+            Some(e) => e.embed_chunks(text),
             None => Err(CoreError::Embedding(
                 "brain opened without a model_dir".into(),
             )),
@@ -348,8 +378,8 @@ impl Brain {
 
         // Post-commit, best-effort — mirrors the deferred vec flush.
         if let Some((note_id, text)) = pending_note_vec {
-            if let Some(vec) = self.embed(&text) {
-                let _ = self.storage.upsert_note_vector(&note_id, &vec);
+            if let Some(chunks) = self.embed_chunks(&text) {
+                let _ = self.storage.upsert_note_vectors(&note_id, &chunks);
             }
         }
 
@@ -1084,7 +1114,9 @@ pub(crate) fn query_row_maps(
 
 /// Port of `_find_existing_entity`: primary SQL-cased lookup, then the
 /// Python-cased alias scan (first DB-row match wins).
-fn find_existing_entity(
+/// pub(crate): `actions.rs` (SYN-135) resolves validated pending facts
+/// alias-aware, exactly like `dream_cycle/validation.py` (SYN-87).
+pub(crate) fn find_existing_entity(
     conn: &Connection,
     canonical_name: &str,
     aliases: &[String],
@@ -1338,7 +1370,7 @@ pub(crate) fn insert_fact(
 
 /// Bind a JSON scalar like Python bound the native value (str/int/float/
 /// bool/None); structures fall back to their compact JSON text.
-fn json_scalar_to_sql(v: &Value) -> SqlV {
+pub(crate) fn json_scalar_to_sql(v: &Value) -> SqlV {
     match v {
         Value::Null => SqlV::Null,
         Value::Bool(b) => SqlV::Integer(*b as i64),
@@ -1571,7 +1603,7 @@ pub(crate) fn entity_embedding_text(entity: &Map<String, Value>) -> String {
 
 /// `json.dumps(v, ensure_ascii=False)` — Python's default separators
 /// (", ", ": ") and insertion order (serde_json preserve_order).
-fn py_dumps(v: &Value) -> String {
+pub(crate) fn py_dumps(v: &Value) -> String {
     match v {
         Value::Object(m) => {
             let inner: Vec<String> = m

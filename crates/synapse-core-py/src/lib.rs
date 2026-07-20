@@ -69,6 +69,12 @@ impl Embedder {
         // ONNX inference can take tens of ms: release the GIL while it runs.
         py.detach(|| self.inner.embed(text)).map_err(core_err)
     }
+
+    /// One vector per ~128-token window of the text (SYN-118); a short text
+    /// yields a single vector identical to `embed`.
+    fn embed_chunks(&self, py: Python<'_>, text: &str) -> PyResult<Vec<Vec<f32>>> {
+        py.detach(|| self.inner.embed_chunks(text)).map_err(core_err)
+    }
 }
 
 /// Storage substrate backed by the shared Rust core (SYN-110 / T1).
@@ -100,6 +106,18 @@ impl Storage {
 
     fn upsert_note_vector(&self, py: Python<'_>, note_id: &str, embedding: &[u8]) -> PyResult<()> {
         py.detach(|| self.inner.upsert_note_vector(note_id, embedding))
+            .map_err(core_err)
+    }
+
+    /// Chunked upsert (SYN-118): one blob per ~128-token window, chunk 0
+    /// keyed by the note uuid (back-compat), then `uuid#k`.
+    fn upsert_note_vectors(
+        &self,
+        py: Python<'_>,
+        note_id: &str,
+        embeddings: Vec<Vec<u8>>,
+    ) -> PyResult<()> {
+        py.detach(|| self.inner.upsert_note_vectors(note_id, &embeddings))
             .map_err(core_err)
     }
 
@@ -190,6 +208,12 @@ impl Storage {
     fn sync_apply(&self, py: Python<'_>, changes_json: &str) -> PyResult<String> {
         py.detach(|| self.inner.sync_apply(changes_json))
             .map_err(core_err)
+    }
+
+    /// SYN-133 — post-pull twin dedup (collapse on the smallest uuid,
+    /// tombstones journaled, doomed notes' vectors swept) → JSON report.
+    fn dedup_after_pull(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| self.inner.dedup_after_pull()).map_err(core_err)
     }
 
     /// → [(id, title, url, summary, score)], score-descending.
@@ -854,12 +878,178 @@ fn fetch_and_extract(py: Python<'_>, url: &str, timeout: f64) -> Option<String> 
         .map(|p| serde_json::json!({"title": p.title, "text": p.text}).to_string())
 }
 
+/// Pairing offerer session (SYN-128): the device that SHOWS the QR keeps this
+/// between showing the offer and receiving the scanner's returned key.
+#[pyclass]
+struct PairingSession {
+    inner: synapse_core::PairingSession,
+    offer_pub: [u8; 32],
+}
+
+#[pymethods]
+impl PairingSession {
+    /// Start a pairing. `addrs` = how the joiner can reach us (LAN URLs).
+    /// Returns (session, qr_string). Render `qr_string` as a QR code.
+    #[staticmethod]
+    fn offer(addrs: Vec<String>) -> PyResult<(Self, String)> {
+        let (inner, offer) = synapse_core::PairingSession::offer(addrs).map_err(core_err)?;
+        let qr = offer.encode();
+        let offer_pub = inner.offer_public();
+        Ok((Self { inner, offer_pub }, qr))
+    }
+
+    /// The offerer's ephemeral public key (bytes), for AAD in seal.
+    fn offer_pub<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.offer_pub)
+    }
+
+    /// Complete with the scanner's returned public key → channel key (bytes).
+    fn channel_key<'py>(&self, py: Python<'py>, accept_pub: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        let ap: [u8; 32] = accept_pub
+            .try_into()
+            .map_err(|_| PyRuntimeError::new_err("accept_pub must be 32 bytes"))?;
+        Ok(PyBytes::new(py, &self.inner.channel_key(&ap)))
+    }
+}
+
+/// Scanner side (SYN-128): decode the QR, return (accept_pub, channel_key) as
+/// bytes. Send accept_pub back to the offerer over the transport.
+#[pyfunction]
+fn pairing_accept<'py>(
+    py: Python<'py>,
+    qr: &str,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let offer = synapse_core::PairingOffer::decode(qr).map_err(core_err)?;
+    let (accept_pub, key) = synapse_core::pairing_accept(&offer).map_err(core_err)?;
+    Ok((PyBytes::new(py, &accept_pub), PyBytes::new(py, &key)))
+}
+
+/// The reachability hints embedded in a QR offer (so a joiner knows where to
+/// call back) — decoded without completing the exchange.
+#[pyfunction]
+fn pairing_offer_addrs(qr: &str) -> PyResult<Vec<String>> {
+    Ok(synapse_core::PairingOffer::decode(qr)
+        .map_err(core_err)?
+        .addrs)
+}
+
+/// AEAD-seal a payload under the channel key (SYN-128/137). Returns base64.
+/// `offer_pub`/`accept_pub` are the two handshake messages of the channel —
+/// X25519 keys (32 B, QR) or SPAKE2 messages (33 B, code) — bound as AAD.
+#[pyfunction]
+fn pairing_seal(
+    channel_key: &[u8],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
+    plaintext: &[u8],
+) -> PyResult<String> {
+    let ck = channel_key32(channel_key)?;
+    synapse_core::pairing_seal(&ck, offer_pub, accept_pub, plaintext).map_err(core_err)
+}
+
+/// Open what `pairing_seal` produced (SYN-128/137) → the plaintext bytes.
+#[pyfunction]
+fn pairing_open<'py>(
+    py: Python<'py>,
+    channel_key: &[u8],
+    offer_pub: &[u8],
+    accept_pub: &[u8],
+    sealed_b64: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let ck = channel_key32(channel_key)?;
+    let out =
+        synapse_core::pairing_open(&ck, offer_pub, accept_pub, sealed_b64).map_err(core_err)?;
+    Ok(PyBytes::new(py, &out))
+}
+
+fn channel_key32(channel_key: &[u8]) -> PyResult<[u8; 32]> {
+    channel_key
+        .try_into()
+        .map_err(|_| PyRuntimeError::new_err("channel_key must be 32 bytes"))
+}
+
+/// SYN-137 — one side of the PAKE on the 6-digit code (symmetric: member and
+/// joiner run the same role). Keep it between sending our message and
+/// receiving the peer's; `finish` is one-shot. Never log the code, the
+/// messages or the key.
+#[pyclass]
+struct CodePairing {
+    inner: Option<synapse_core::CodePairing>,
+    msg: Vec<u8>,
+}
+
+#[pymethods]
+impl CodePairing {
+    #[new]
+    fn new(code: &str) -> Self {
+        let (inner, msg) = synapse_core::CodePairing::start(code);
+        Self {
+            inner: Some(inner),
+            msg,
+        }
+    }
+
+    /// Our handshake message (bytes) to send to the peer.
+    fn msg<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.msg)
+    }
+
+    /// Complete with the peer's message → the 32-byte channel key. A wrong
+    /// code still succeeds but yields a different key — confirm with
+    /// `pairing_code_confirm_mac`/`_verify` before trusting the channel.
+    fn finish<'py>(&mut self, py: Python<'py>, peer_msg: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("code pairing already finished"))?;
+        let key = inner.finish(peer_msg).map_err(core_err)?;
+        Ok(PyBytes::new(py, &key))
+    }
+}
+
+/// SYN-137 joiner side: key-confirmation MAC over the transcript.
+#[pyfunction]
+fn pairing_code_confirm_mac<'py>(
+    py: Python<'py>,
+    channel_key: &[u8],
+    member_msg: &[u8],
+    joiner_msg: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let ck = channel_key32(channel_key)?;
+    Ok(PyBytes::new(
+        py,
+        &synapse_core::code_confirm_mac(&ck, member_msg, joiner_msg),
+    ))
+}
+
+/// SYN-137 member side: constant-time verify; a mismatch burns one attempt.
+#[pyfunction]
+fn pairing_code_confirm_verify(
+    channel_key: &[u8],
+    member_msg: &[u8],
+    joiner_msg: &[u8],
+    mac: &[u8],
+) -> PyResult<bool> {
+    let ck = channel_key32(channel_key)?;
+    Ok(synapse_core::code_confirm_verify(
+        &ck, member_msg, joiner_msg, mac,
+    ))
+}
+
 #[pymodule(name = "synapse_core")]
 fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Embedder>()?;
     m.add_class::<Storage>()?;
     m.add_class::<SqlConnection>()?;
     m.add_class::<Brain>()?;
+    m.add_class::<PairingSession>()?;
+    m.add_class::<CodePairing>()?;
+    m.add_function(wrap_pyfunction!(pairing_accept, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_offer_addrs, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_seal, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_open, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_code_confirm_mac, m)?)?;
+    m.add_function(wrap_pyfunction!(pairing_code_confirm_verify, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(parse_classify_text, m)?)?;
     m.add_function(wrap_pyfunction!(next_occurrence, m)?)?;

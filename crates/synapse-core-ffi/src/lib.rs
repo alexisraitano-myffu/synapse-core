@@ -54,6 +54,11 @@ impl Embedder {
     pub fn embed(&self, text: String) -> Result<Vec<f32>, CoreError> {
         Ok(self.inner.embed(&text)?)
     }
+
+    /// One vector per ~128-token window (SYN-118); short text = one vector.
+    pub fn embed_chunks(&self, text: String) -> Result<Vec<Vec<f32>>, CoreError> {
+        Ok(self.inner.embed_chunks(&text)?)
+    }
 }
 
 /// A note KNN hit; `distance` is sqlite-vec's L2 on unit vectors ([0, 2]).
@@ -101,6 +106,15 @@ impl Storage {
 
     pub fn upsert_note_vector(&self, note_id: String, embedding: Vec<u8>) -> Result<(), CoreError> {
         Ok(self.inner.upsert_note_vector(&note_id, &embedding)?)
+    }
+
+    /// Chunked upsert (SYN-118): chunk 0 keyed by the note uuid, then `uuid#k`.
+    pub fn upsert_note_vectors(
+        &self,
+        note_id: String,
+        embeddings: Vec<Vec<u8>>,
+    ) -> Result<(), CoreError> {
+        Ok(self.inner.upsert_note_vectors(&note_id, &embeddings)?)
     }
 
     pub fn delete_note_vector(&self, note_id: String) -> Result<(), CoreError> {
@@ -197,6 +211,12 @@ impl Storage {
     pub fn sync_apply(&self, changes_json: String) -> Result<String, CoreError> {
         Ok(self.inner.sync_apply(&changes_json)?)
     }
+
+    /// SYN-133 — post-pull twin dedup (collapse on the smallest uuid,
+    /// tombstones journaled, doomed notes' vectors swept) → JSON report.
+    pub fn dedup_after_pull(&self) -> Result<String, CoreError> {
+        Ok(self.inner.dedup_after_pull()?)
+    }
 }
 
 /// One SQLite value crossing the FFI boundary, in either direction.
@@ -241,6 +261,31 @@ pub struct SqlResult {
     pub rows: Vec<Vec<SqlValue>>,
 }
 
+/// LLM call settings shared by the cycle passes (mirror of the core's
+/// LlmConfig; a fuel token routes through the proxy instead of a raw key).
+#[derive(uniffi::Record)]
+pub struct LlmSettings {
+    pub model: String,
+    pub api_key: String,
+    pub prompts_dir: String,
+    pub today: String,
+    pub base_url: Option<String>,
+    pub fuel_token: Option<String>,
+}
+
+impl From<LlmSettings> for synapse_core::LlmConfig {
+    fn from(s: LlmSettings) -> Self {
+        synapse_core::LlmConfig {
+            model: s.model,
+            api_key: s.api_key,
+            base_url: s.base_url,
+            fuel_token: s.fuel_token,
+            prompts_dir: s.prompts_dir,
+            today: s.today,
+        }
+    }
+}
+
 /// Generic SQL access to the core-owned database — the ONLY SQLite in the
 /// process (mixing two SQLite libraries on one file corrupts it).
 #[derive(uniffi::Object)]
@@ -273,6 +318,182 @@ impl SqlConnection {
     pub fn last_insert_rowid(&self) -> Result<i64, CoreError> {
         Ok(self.inner.last_insert_rowid()?)
     }
+
+    /// SYN-132 — one-call read snapshot for the app's local replica: the same
+    /// JSON shapes as the desktop backend's read endpoints, served from this
+    /// local core db.
+    pub fn read_snapshot(&self) -> Result<String, CoreError> {
+        Ok(self.inner.read_snapshot()?.to_string())
+    }
+
+    /// SYN-132 — reverse provenance of one capture (`/capture/{id}/generated`).
+    pub fn generated_for_capture(&self, capture_id: String) -> Result<String, CoreError> {
+        Ok(self.inner.generated_for_capture(&capture_id)?.to_string())
+    }
+
+    /// SYN-135 — apply one app action-log entry (validate/archive/rename/
+    /// relation CRUD/merge accept/…) to this local db, mirroring the desktop
+    /// backend's write endpoints. Own IMMEDIATE transaction; returns the
+    /// outcome JSON (`status` = ok/confirmed/accepted/… or not_found/skipped
+    /// for moot replays).
+    pub fn apply_action(
+        &self,
+        action_type: String,
+        payload_json: String,
+    ) -> Result<String, CoreError> {
+        Ok(self
+            .inner
+            .apply_action(&action_type, &payload_json)?
+            .to_string())
+    }
+
+    // ── Full-cycle passes (SYN-130): the mobile host runs the same Dream
+    // Cycle as the desktop backend, so the T5 surface crosses the FFI too. ──
+
+    /// SYN-19 decay pass over atomic_notes; `now` = optional fixed clock
+    /// 'YYYY-MM-DD HH:MM:SS' (tests inject it), None = system now.
+    pub fn apply_decay(&self, tau_days: Option<f64>, now: Option<String>) -> Result<i64, CoreError> {
+        Ok(self.inner.apply_decay(tau_days, now.as_deref())?)
+    }
+
+    /// SYN-68 decay pass over entities (anchor `last_mentioned`).
+    pub fn apply_entity_decay(
+        &self,
+        tau_days: Option<f64>,
+        now: Option<String>,
+    ) -> Result<i64, CoreError> {
+        Ok(self.inner.apply_entity_decay(tau_days, now.as_deref())?)
+    }
+
+    /// Move notes' reactivation anchor toward now (1.0 = full mention reset,
+    /// <1 = light search bump). Returns the count touched.
+    pub fn reactivate_notes(
+        &self,
+        note_ids: Vec<String>,
+        factor: f64,
+        now: Option<String>,
+    ) -> Result<i64, CoreError> {
+        Ok(self.inner.reactivate_notes(&note_ids, factor, now.as_deref())?)
+    }
+
+    /// Full reactivation of every note mentioning one of `entity_names`.
+    pub fn reactivate_notes_for_entities(
+        &self,
+        entity_names: Vec<String>,
+        now: Option<String>,
+    ) -> Result<i64, CoreError> {
+        Ok(self
+            .inner
+            .reactivate_notes_for_entities(&entity_names, now.as_deref())?)
+    }
+
+    /// SYN-23 — the digest's structured week as JSON (pure SQL on THIS
+    /// connection, offline). `now` = optional fixed clock 'YYYY-MM-DD HH:MM:SS'.
+    pub fn gather_week(&self, now: Option<String>, days: i64) -> Result<String, CoreError> {
+        Ok(self.inner.gather_week(now.as_deref(), days)?.to_string())
+    }
+}
+
+// ── Pairing channel (SYN-128): authenticated secret transfer at join time ──
+
+/// Scanner-side result of accepting a QR offer: send `accept_pub` back to the
+/// offerer over the transport; keep `channel_key` to open the sealed payload.
+/// `offer_pub` (from the QR) rides along because `pairing_open` needs it as
+/// AAD — the joiner shouldn't have to re-parse the QR format (SYN-128).
+#[derive(uniffi::Record)]
+pub struct PairingAccept {
+    pub accept_pub: Vec<u8>,
+    pub channel_key: Vec<u8>,
+    pub offer_pub: Vec<u8>,
+}
+
+/// Pairing offerer session (SYN-128): the device that SHOWS the QR keeps this
+/// between showing the offer and receiving the scanner's returned key.
+#[derive(uniffi::Object)]
+pub struct PairingSession {
+    inner: synapse_core::PairingSession,
+    qr: String,
+}
+
+#[uniffi::export]
+impl PairingSession {
+    /// Start a pairing. `addrs` = how the joiner can reach us (LAN URLs).
+    /// Render `qr()` as a QR code.
+    #[uniffi::constructor]
+    pub fn offer(addrs: Vec<String>) -> Result<Arc<Self>, CoreError> {
+        let (inner, offer) = synapse_core::PairingSession::offer(addrs)?;
+        let qr = offer.encode();
+        Ok(Arc::new(Self { inner, qr }))
+    }
+
+    /// The offer string to render as a QR code.
+    pub fn qr(&self) -> String {
+        self.qr.clone()
+    }
+
+    /// The offerer's ephemeral public key (32 bytes), for AAD in seal.
+    pub fn offer_pub(&self) -> Vec<u8> {
+        self.inner.offer_public().to_vec()
+    }
+
+    /// Complete with the scanner's returned public key → channel key.
+    pub fn channel_key(&self, accept_pub: Vec<u8>) -> Result<Vec<u8>, CoreError> {
+        let ap = key32(&accept_pub, "accept_pub")?;
+        Ok(self.inner.channel_key(&ap).to_vec())
+    }
+}
+
+/// Scanner side (SYN-128): decode the QR and derive the channel key.
+#[uniffi::export]
+pub fn pairing_accept(qr: String) -> Result<PairingAccept, CoreError> {
+    let offer = synapse_core::PairingOffer::decode(&qr)?;
+    let (accept_pub, channel_key) = synapse_core::pairing_accept(&offer)?;
+    Ok(PairingAccept {
+        accept_pub: accept_pub.to_vec(),
+        channel_key: channel_key.to_vec(),
+        offer_pub: offer.offer_pub.to_vec(),
+    })
+}
+
+/// The reachability hints embedded in a QR offer (so a joiner knows where to
+/// call back) — decoded without completing the exchange.
+#[uniffi::export]
+pub fn pairing_offer_addrs(qr: String) -> Result<Vec<String>, CoreError> {
+    Ok(synapse_core::PairingOffer::decode(&qr)?.addrs)
+}
+
+/// AEAD-seal a payload under the channel key (SYN-128). Returns base64.
+#[uniffi::export]
+pub fn pairing_seal(
+    channel_key: Vec<u8>,
+    offer_pub: Vec<u8>,
+    accept_pub: Vec<u8>,
+    plaintext: Vec<u8>,
+) -> Result<String, CoreError> {
+    let ck = key32(&channel_key, "channel_key")?;
+    let op = key32(&offer_pub, "offer_pub")?;
+    let ap = key32(&accept_pub, "accept_pub")?;
+    Ok(synapse_core::pairing_seal(&ck, &op, &ap, &plaintext)?)
+}
+
+/// Open what `pairing_seal` produced (SYN-128) → the plaintext bytes.
+#[uniffi::export]
+pub fn pairing_open(
+    channel_key: Vec<u8>,
+    offer_pub: Vec<u8>,
+    accept_pub: Vec<u8>,
+    sealed_b64: String,
+) -> Result<Vec<u8>, CoreError> {
+    let ck = key32(&channel_key, "channel_key")?;
+    let op = key32(&offer_pub, "offer_pub")?;
+    let ap = key32(&accept_pub, "accept_pub")?;
+    Ok(synapse_core::pairing_open(&ck, &op, &ap, &sealed_b64)?)
+}
+
+fn key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CoreError> {
+    bytes.try_into().map_err(|_| CoreError::Storage {
+        msg: format!("pairing: {what} must be 32 bytes"),
+    })
 }
 
 /// The Dream Cycle brain (SYN-111): deterministic routing + classifier
@@ -319,6 +540,93 @@ impl Brain {
     /// the re-embed path after a sync apply on mobile hosts.
     pub fn embed(&self, text: String) -> Result<Vec<f32>, CoreError> {
         Ok(self.inner.embed_text(&text)?)
+    }
+
+    /// Chunked variant (SYN-118): one vector per ~128-token window, feeding
+    /// `Storage.upsert_note_vectors` so mobile re-embeds match the desktop.
+    pub fn embed_chunks(&self, text: String) -> Result<Vec<Vec<f32>>, CoreError> {
+        Ok(self.inner.embed_text_chunks(&text)?)
+    }
+
+    // ── Full-cycle passes (SYN-130): total parity with the desktop host. ──
+
+    /// SYN-89 re-summary pass (T5): entities touched by the run + stale ones,
+    /// summaries rebuilt from active facts/relations via the LLM. Returns the
+    /// regenerated entity ids as a JSON array. An HTTP failure stops the pass
+    /// silently (stale flags survive).
+    pub fn resummarize(
+        &self,
+        touched_ids: Vec<String>,
+        config: LlmSettings,
+    ) -> Result<String, CoreError> {
+        let ids = self.inner.resummarize(&touched_ids, &config.into())?;
+        Ok(serde_json::Value::from(ids).to_string())
+    }
+
+    /// SYN-43/44 living project synthesis (T5): append + threshold-triggered
+    /// refinement. Returns the new summary_md or None (failures never block).
+    pub fn synthesize_project(
+        &self,
+        project_id: String,
+        project_name: String,
+        new_entry_content: String,
+        new_entry_count: i64,
+        config: LlmSettings,
+    ) -> Result<Option<String>, CoreError> {
+        Ok(self.inner.synthesize_project(
+            &project_id,
+            &project_name,
+            &new_entry_content,
+            new_entry_count,
+            &config.into(),
+        )?)
+    }
+
+    /// Port of `step6_vectorize` (T5): embed each entity's composite text and
+    /// store the vector; per-entity failures skip. Returns the count.
+    pub fn vectorize_entities(&self, entity_ids: Vec<String>) -> Result<i64, CoreError> {
+        Ok(self.inner.vectorize_entities(&entity_ids)?)
+    }
+
+    /// SYN-23 — render the gathered week (JSON string) into the digest
+    /// markdown (prompt = data `digest.md`, LLM via the core HTTP path).
+    pub fn summarize_digest(
+        &self,
+        week_json: String,
+        config: LlmSettings,
+    ) -> Result<String, CoreError> {
+        let week: serde_json::Value = serde_json::from_str(&week_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        Ok(self.inner.summarize_digest(&week, &config.into())?)
+    }
+
+    /// SYN-23 — store the digest note (idempotent per ISO week) + its vector,
+    /// on the Brain's OWN connection: call outside host transactions. Returns
+    /// the note id.
+    pub fn write_digest_note(
+        &self,
+        week_json: String,
+        markdown: String,
+    ) -> Result<String, CoreError> {
+        let week: serde_json::Value = serde_json::from_str(&week_json)
+            .map_err(|e| CoreError::Storage { msg: e.to_string() })?;
+        Ok(self.inner.write_digest_note(&week, &markdown)?)
+    }
+
+    /// SYN-21 — process every URL found in a capture (each independent, one
+    /// failure never blocks the others). `config = None` → snippet-fallback
+    /// summaries (no LLM). Returns the stored resource ids as a JSON array.
+    pub fn process_capture_resources(
+        &self,
+        content: String,
+        capture_id: Option<String>,
+        config: Option<LlmSettings>,
+    ) -> Result<String, CoreError> {
+        let cfg: Option<synapse_core::LlmConfig> = config.map(Into::into);
+        let ids = self
+            .inner
+            .process_capture_resources(&content, capture_id.as_deref(), cfg.as_ref())?;
+        Ok(serde_json::Value::from(ids).to_string())
     }
 
     pub fn validate_pending(&self, new_facts_json: String) -> Result<i64, CoreError> {

@@ -11,6 +11,22 @@ pub const EMBEDDING_DIM: usize = 384;
 /// Truncation fallback when the tokenizer config carries no usable value.
 const DEFAULT_MAX_LENGTH: usize = 512;
 
+// ── Chunked embedding (SYN-118) ──────────────────────────────────────────
+// The qdrant export truncates at 128 tokens, and that is the RIGHT granule:
+// this is a sentence model — mean-pooling a 460-token digest into one vector
+// dilutes every section (measured: tail queries 0.31→0.22 when embedding the
+// full text at 512). Long texts are therefore embedded as one vector PER
+// ~128-token window and the search takes the best-scoring window.
+
+/// Tokens shared between consecutive windows so a sentence cut at a boundary
+/// still lives whole in one of them.
+const CHUNK_OVERLAP_TOKENS: usize = 24;
+
+/// Upper bound on windows per text (~16 × 124 tokens ≈ 2000 tokens covered;
+/// beyond that the tail is dropped, like the old 128 truncation but 16× later).
+/// Storage sweeps this many candidate chunk keys on delete — keep in sync.
+pub const MAX_CHUNKS: usize = 16;
+
 /// ONNX file names probed inside the model directory, in order. The first is
 /// the exact file the Python backend uses (qdrant HF repo layout).
 const ONNX_CANDIDATES: &[&str] = &["model_optimized.onnx", "model.onnx", "onnx/model.onnx"];
@@ -41,6 +57,11 @@ pub struct Embedder {
     // fastembed's embed() needs &mut; the Mutex also gives us the Send + Sync
     // bound UniFFI requires for interface objects.
     model: Mutex<TextEmbedding>,
+    // Same tokenizer.json as the model, used ONLY to window long texts for
+    // embed_chunks (truncation disabled: it must see the real length).
+    chunker: tokenizers::Tokenizer,
+    /// Effective per-window token budget (the model's truncation cap).
+    max_tokens: usize,
 }
 
 impl Embedder {
@@ -80,6 +101,12 @@ impl Embedder {
         let max_length = effective_max_length(&tokenizer_files.tokenizer_config_file)
             .unwrap_or(DEFAULT_MAX_LENGTH);
 
+        let mut chunker = tokenizers::Tokenizer::from_bytes(&tokenizer_files.tokenizer_file)
+            .map_err(|e| CoreError::ModelLoad(format!("chunker tokenizer: {e}")))?;
+        chunker.with_truncation(None).map_err(|e| {
+            CoreError::ModelLoad(format!("chunker truncation off: {e}"))
+        })?;
+
         // Mean pooling: what the Python fastembed applies to this model (the
         // backend silences the very warning that announced this default).
         let model_def =
@@ -98,7 +125,51 @@ impl Embedder {
 
         Ok(Self {
             model: Mutex::new(model),
+            chunker,
+            max_tokens: max_length,
         })
+    }
+
+    /// Embed a text as one L2-normalized vector per ~`max_tokens` window
+    /// (SYN-118). A text that fits in one window returns a single vector,
+    /// embedded from the ORIGINAL string (bit-identical to `embed`); longer
+    /// texts are windowed on token ids with `CHUNK_OVERLAP_TOKENS` overlap,
+    /// each window decoded back to text and embedded. At most `MAX_CHUNKS`
+    /// windows: a pathological text is covered ~16× further than before.
+    pub fn embed_chunks(&self, text: &str) -> Result<Vec<Vec<f32>>, CoreError> {
+        let enc = self
+            .chunker
+            .encode(text, false)
+            .map_err(|e| CoreError::Embedding(format!("chunker encode: {e}")))?;
+        let ids = enc.get_ids();
+        // Leave room for the special tokens the real encode adds per window.
+        let budget = self.max_tokens.saturating_sub(4).max(16);
+        if ids.len() <= budget {
+            return Ok(vec![self.embed(text)?]);
+        }
+
+        let overlap = CHUNK_OVERLAP_TOKENS.min(budget / 2);
+        let stride = budget - overlap;
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < ids.len() && chunks.len() < MAX_CHUNKS {
+            let end = (start + budget).min(ids.len());
+            let piece = self
+                .chunker
+                .decode(&ids[start..end], true)
+                .map_err(|e| CoreError::Embedding(format!("chunker decode: {e}")))?;
+            if !piece.trim().is_empty() {
+                chunks.push(self.embed(&piece)?);
+            }
+            if end == ids.len() {
+                break;
+            }
+            start += stride;
+        }
+        if chunks.is_empty() {
+            chunks.push(self.embed(text)?);
+        }
+        Ok(chunks)
     }
 
     /// Embed a text into an L2-normalized `EMBEDDING_DIM` vector.
@@ -172,6 +243,38 @@ mod tests {
         assert_eq!(v.len(), EMBEDDING_DIM);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4, "norm was {norm}");
+    }
+
+    // SYN-118 — chunked embedding of long texts.
+    #[test]
+    fn embed_chunks_windows_long_text_and_matches_embed_for_short() {
+        let Some(dir) = model_dir() else {
+            eprintln!("SYNAPSE_MODEL_DIR not set or empty; skipping");
+            return;
+        };
+        let embedder = Embedder::new(&dir).unwrap();
+
+        // Short text: exactly one chunk, bit-identical to embed().
+        let short = "Alexis travaille sur le projet Synapse.";
+        let chunks = embedder.embed_chunks(short).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], embedder.embed(short).unwrap());
+
+        // Long text (~50 distinct sentences ≫ 128 tokens): several windows,
+        // all normalized, and the windows are genuinely different vectors.
+        let long = (0..50)
+            .map(|i| format!("La phrase numéro {i} parle du sujet {} en détail.", i * 7))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let chunks = embedder.embed_chunks(&long).unwrap();
+        assert!(chunks.len() > 1, "expected windows, got {}", chunks.len());
+        assert!(chunks.len() <= MAX_CHUNKS);
+        for c in &chunks {
+            assert_eq!(c.len(), EMBEDDING_DIM);
+            let norm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4);
+        }
+        assert_ne!(chunks[0], chunks[chunks.len() - 1]);
     }
 
     #[test]

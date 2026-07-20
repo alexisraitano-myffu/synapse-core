@@ -127,6 +127,25 @@ impl Storage {
         crate::sync::apply_changes(&conn, changes_json)
     }
 
+    /// SYN-133 — post-pull safety net: collapse derived twins (same capture
+    /// routed by two devices during a no-sync window) onto the smallest uuid,
+    /// then sweep the doomed notes' vec0 rows (chunked keys included). The
+    /// deletions journal as tombstones → the collapse replicates. Run it
+    /// after every pull, on every host. Returns a JSON report
+    /// `{"removed": {table: n}, "doomed_notes": [...]}`.
+    pub fn dedup_after_pull(&self) -> Result<String, CoreError> {
+        let (removed, doomed_notes) = {
+            let conn = self.lock()?;
+            crate::sync::dedup_after_pull(&conn)?
+        };
+        // Vector sweep outside the row transaction (and after the guard drops
+        // — delete_note_vector re-locks this connection).
+        for nid in &doomed_notes {
+            let _ = self.delete_note_vector(nid);
+        }
+        Ok(serde_json::json!({"removed": removed, "doomed_notes": doomed_notes}).to_string())
+    }
+
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, CoreError> {
         self.conn
             .lock()
@@ -136,20 +155,72 @@ impl Storage {
     // ── Notes (vec0) ─────────────────────────────────────────────────────
 
     pub fn upsert_note_vector(&self, note_id: &str, embedding: &[u8]) -> Result<(), CoreError> {
-        check_dim(embedding)?;
-        self.lock()?.execute(
-            "INSERT OR REPLACE INTO atomic_notes_vec(note_id, embedding) VALUES (?1, ?2)",
-            params![note_id, embedding],
-        )?;
+        self.upsert_note_vectors(note_id, std::slice::from_ref(&embedding.to_vec()))
+    }
+
+    /// Store one vector per chunk for a note (SYN-118): chunk 0 keeps the
+    /// note's uuid as its vec0 key (back-compat: point lookups and single-
+    /// vector writers see no difference), later chunks are keyed `uuid#k`.
+    /// Replaces atomically whatever chunk set the note had before.
+    pub fn upsert_note_vectors(
+        &self,
+        note_id: &str,
+        embeddings: &[Vec<u8>],
+    ) -> Result<(), CoreError> {
+        if embeddings.is_empty() {
+            return Err(CoreError::Storage("no embedding provided".into()));
+        }
+        for e in embeddings {
+            check_dim(e)?;
+        }
+        let conn = self.lock()?;
+        // vec0 doesn't implement OR REPLACE (an existing key surfaces as a
+        // UNIQUE constraint failure), so upsert = delete every possible old
+        // chunk key, then insert the new set.
+        for key in Self::chunk_keys(note_id) {
+            conn.execute(
+                "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
+                params![key],
+            )?;
+        }
+        for (k, e) in embeddings.iter().take(crate::embedder::MAX_CHUNKS).enumerate() {
+            let key = if k == 0 {
+                note_id.to_string()
+            } else {
+                format!("{note_id}#{k}")
+            };
+            conn.execute(
+                "INSERT INTO atomic_notes_vec(note_id, embedding) VALUES (?1, ?2)",
+                params![key, e],
+            )?;
+        }
         Ok(())
     }
 
     pub fn delete_note_vector(&self, note_id: &str) -> Result<(), CoreError> {
-        self.lock()?.execute(
-            "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
-            params![note_id],
-        )?;
+        let conn = self.lock()?;
+        for key in Self::chunk_keys(note_id) {
+            conn.execute(
+                "DELETE FROM atomic_notes_vec WHERE note_id = ?1",
+                params![key],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Every vec0 key a note may occupy: its uuid (chunk 0) then `uuid#k`.
+    fn chunk_keys(note_id: &str) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(note_id.to_string())
+            .chain((1..crate::embedder::MAX_CHUNKS).map(move |k| format!("{note_id}#{k}")))
+    }
+
+    /// vec0 key → the note uuid it belongs to (strips a `#k` chunk suffix;
+    /// only an all-digit suffix counts, so an exotic id keeps its own key).
+    fn base_note_id(key: &str) -> &str {
+        match key.rsplit_once('#') {
+            Some((base, k)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()) => base,
+            _ => key,
+        }
     }
 
     pub fn get_note_vector(&self, note_id: &str) -> Result<Option<Vec<u8>>, CoreError> {
@@ -167,18 +238,35 @@ impl Storage {
     pub fn search_notes(&self, query: &[u8], k: u32) -> Result<Vec<NoteHit>, CoreError> {
         check_dim(query)?;
         let conn = self.lock()?;
+        // A long note owns several chunk vectors (SYN-118): over-fetch, then
+        // keep each note's BEST chunk so callers still see one hit per note.
+        let fetch = (k as usize).saturating_mul(4).clamp(1, 4096) as u32;
         let mut stmt = conn.prepare(
             "SELECT note_id, distance FROM atomic_notes_vec \
              WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance",
         )?;
-        let hits = stmt
-            .query_map(params![query, k], |row| {
-                Ok(NoteHit {
-                    note_id: row.get(0)?,
-                    distance: row.get(1)?,
-                })
+        let raw = stmt
+            .query_map(params![query, fetch], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+
+        let mut hits: Vec<NoteHit> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (key, distance) in raw {
+            // Rows arrive distance-ascending: the first key of a note is its
+            // best chunk, later chunks of the same note are skipped.
+            let base = Self::base_note_id(&key).to_string();
+            if seen.insert(base.clone()) {
+                hits.push(NoteHit {
+                    note_id: base,
+                    distance,
+                });
+                if hits.len() == k as usize {
+                    break;
+                }
+            }
+        }
         Ok(hits)
     }
 
@@ -198,7 +286,7 @@ impl Storage {
         resource_id: &str,
         embedding: &[u8],
     ) -> Result<(), CoreError> {
-        check_dim(embedding)?;
+        check_dim_frames(embedding)?;
         self.lock()?.execute(
             "UPDATE resources SET embedding = ?1 WHERE id = ?2",
             params![embedding, resource_id],
@@ -235,7 +323,7 @@ impl Storage {
         let mut scored: Vec<ResourceHit> = Vec::new();
         while let Some(row) = rows.next()? {
             let blob: Vec<u8> = row.get(4)?;
-            let Some(score) = score_against(&q, &blob) else {
+            let Some(score) = score_against_frames(&q, &blob) else {
                 continue;
             };
             let title: Option<String> = row.get(1)?;
@@ -328,6 +416,18 @@ fn check_dim(embedding: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// SYN-118: a resource embedding BLOB may hold several concatenated
+/// `EMBEDDING_BYTES` frames (one per ~128-token chunk of the summary).
+fn check_dim_frames(embedding: &[u8]) -> Result<(), CoreError> {
+    if embedding.is_empty() || embedding.len() % EMBEDDING_BYTES != 0 {
+        return Err(CoreError::Storage(format!(
+            "embedding must be a non-empty multiple of {EMBEDDING_BYTES} bytes, got {}",
+            embedding.len()
+        )));
+    }
+    Ok(())
+}
+
 fn parse_query(query: &[u8]) -> Result<Vec<f64>, CoreError> {
     check_dim(query)?;
     Ok(blob_to_f64(query))
@@ -357,6 +457,18 @@ fn score_against(q: &[f64], blob: &[u8]) -> Option<f64> {
     Some((score * 10000.0).round() / 10000.0)
 }
 
+/// Best `score_against` over the frames of a (possibly multi-chunk) blob
+/// (SYN-118): a query only has to match ONE chunk of a long summary.
+fn score_against_frames(q: &[f64], blob: &[u8]) -> Option<f64> {
+    let frame = q.len() * 4;
+    if frame == 0 || blob.is_empty() || blob.len() % frame != 0 {
+        return None;
+    }
+    blob.chunks_exact(frame)
+        .filter_map(|f| score_against(q, f))
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +496,92 @@ mod tests {
                 params![id, name, etype],
             )
             .unwrap();
+    }
+
+    // SYN-118 — chunked storage: one vec0 row per window, search returns ONE
+    // hit per note (its best chunk), re-upsert clears stale chunk rows.
+    #[test]
+    fn chunked_notes_dedupe_to_best_chunk_and_replace_cleanly() {
+        let (_dir, storage) = open_temp();
+        let query = unit_vec(0.0);
+        // Note A: 3 chunks, the LAST one is the close match. Note B: 1 chunk.
+        storage
+            .upsert_note_vectors("a", &[unit_vec(2.0), unit_vec(1.5), unit_vec(0.1)])
+            .unwrap();
+        storage.upsert_note_vectors("b", &[unit_vec(0.4)]).unwrap();
+
+        let hits = storage.search_notes(&query, 5).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.note_id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "one hit per note, best chunk first"
+        );
+        assert!(hits[0].distance < hits[1].distance);
+
+        // Replace A with a single far chunk: the old #1/#2 rows must be gone,
+        // so B now wins and A scores on its ONLY remaining vector.
+        storage.upsert_note_vectors("a", &[unit_vec(2.0)]).unwrap();
+        let n: i64 = storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM atomic_notes_vec WHERE note_id LIKE 'a%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "stale chunk rows swept");
+        let hits = storage.search_notes(&query, 5).unwrap();
+        assert_eq!(hits[0].note_id, "b");
+
+        // delete sweeps every chunk key too.
+        storage
+            .upsert_note_vectors("a", &[unit_vec(2.0), unit_vec(1.0)])
+            .unwrap();
+        storage.delete_note_vector("a").unwrap();
+        let hits = storage.search_notes(&query, 5).unwrap();
+        assert_eq!(hits.iter().map(|h| h.note_id.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn base_note_id_strips_only_numeric_chunk_suffix() {
+        assert_eq!(Storage::base_note_id("uuid-1#3"), "uuid-1");
+        assert_eq!(Storage::base_note_id("uuid-1"), "uuid-1");
+        assert_eq!(Storage::base_note_id("weird#id"), "weird#id");
+        assert_eq!(Storage::base_note_id("trailing#"), "trailing#");
+    }
+
+    #[test]
+    fn score_against_frames_takes_best_frame() {
+        let q = blob_to_f64(&unit_vec(0.0));
+        let far = unit_vec(2.0);
+        let near = unit_vec(0.1);
+        let blob: Vec<u8> = [far.clone(), near.clone()].concat();
+        let best = score_against_frames(&q, &blob).unwrap();
+        assert_eq!(best, score_against(&q, &near).unwrap());
+        assert!(best > score_against(&q, &far).unwrap());
+        // Corrupt length → None, like the single-frame scorer.
+        assert!(score_against_frames(&q, &blob[..10]).is_none());
+    }
+
+    // SYN-118 — vec0 rejects INSERT OR REPLACE, so a re-embed of an EXISTING
+    // note used to fail with a UNIQUE constraint error. Upsert must replace.
+    #[test]
+    fn upsert_note_vector_replaces_existing() {
+        let (_dir, storage) = open_temp();
+        storage.upsert_note_vector("n1", &unit_vec(0.0)).unwrap();
+        storage.upsert_note_vector("n1", &unit_vec(1.0)).unwrap();
+        let stored = storage.get_note_vector("n1").unwrap().unwrap();
+        assert_eq!(stored, unit_vec(1.0));
+        let conn = storage.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM atomic_notes_vec WHERE note_id = 'n1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

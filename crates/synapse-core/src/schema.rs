@@ -222,6 +222,26 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             epoch      INTEGER NOT NULL DEFAULT 1,
             claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )",
+        // SYN-127 — the user's memory space: replicated singleton (row id
+        // 'space'), created by the OWNER device only when missing (a fresh
+        // replica must never self-create one: its newer HLC would win the
+        // LWW merge and overwrite the mesh's space on bootstrap).
+        "CREATE TABLE IF NOT EXISTS space (
+            id         TEXT PRIMARY KEY,
+            space_id   TEXT NOT NULL,
+            name       TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        // SYN-127 — one row per device in the mesh (replicated): what the
+        // Settings « Appareils » screen lists. Each device upserts its OWN
+        // row (pk = its sync device_id) so rows never conflict across peers.
+        "CREATE TABLE IF NOT EXISTS devices (
+            device_id  TEXT PRIMARY KEY,
+            name       TEXT,
+            platform   TEXT,
+            last_seen  TIMESTAMP,
+            revoked_at TIMESTAMP
+        )",
     ];
 
     for stmt in creates {

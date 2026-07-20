@@ -336,8 +336,8 @@ impl Brain {
         for nid in &stale {
             let _ = self.storage.delete_note_vector(nid);
         }
-        if let Some(vec) = self.embed(&format!("{title}\n{markdown}")) {
-            let _ = self.storage.upsert_note_vector(&note_id, &vec);
+        if let Some(chunks) = self.embed_chunks(&format!("{title}\n{markdown}")) {
+            let _ = self.storage.upsert_note_vectors(&note_id, &chunks);
         }
         Ok(note_id)
     }
