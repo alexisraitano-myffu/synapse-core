@@ -261,7 +261,8 @@ impl Brain {
         let week_start = week["week_start"].as_str().unwrap_or("");
         let params_json = json!({
             "model": config.model,
-            "max_tokens": 1400,
+            // SYN-124 — markdown long + marge de raisonnement, cf. summaries::resummarize.
+            "max_tokens": 3072,
             "system": system,
             "messages": [{"role": "user", "content": format!(
                 "Matière de la semaine (semaine du {week_start}) :\n\n{payload}")}],

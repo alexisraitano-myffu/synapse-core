@@ -178,7 +178,12 @@ impl Brain {
 
             let params_json = json!({
                 "model": config.model,
-                "max_tokens": 300,
+                // SYN-124 — budget = sortie + marge pour un bloc de raisonnement. Un modèle
+                // qui « pense » dépense d'abord son budget en thinking : dimensionné pour la
+                // seule sortie, il rend une réponse vide tronquée à max_tokens (cas mesuré sur
+                // Gemma E4B). max_tokens est un plafond, pas une cible : relever ne coûte rien
+                // tant que le modèle ne génère pas plus.
+                "max_tokens": 1024,
                 "system": system_e,
                 "messages": [{"role": "user", "content": lines.join("\n")}],
             });
@@ -302,7 +307,8 @@ fn append_project_summary(
 
     let params_json = json!({
         "model": config.model,
-        "max_tokens": 1024,
+        // SYN-124 — ~500 mots demandés + marge de raisonnement, cf. resummarize.
+        "max_tokens": 2048,
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": user_msg}],
     });
@@ -394,7 +400,8 @@ fn refine_project_summary(
 
     let params_json = json!({
         "model": config.model,
-        "max_tokens": 2048,
+        // SYN-124 — 500-800 mots demandés + marge de raisonnement, cf. resummarize.
+        "max_tokens": 3072,
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": user_msg}],
     });

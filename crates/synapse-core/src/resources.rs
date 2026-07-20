@@ -283,7 +283,8 @@ fn summarize(config: Option<&LlmConfig>, title: &str, text: &str) -> String {
     let head: String = text.chars().take(8000).collect();
     let params_json = json!({
         "model": config.model,
-        "max_tokens": 300,
+        // SYN-124 — 2-4 phrases demandées + marge de raisonnement, cf. summaries::resummarize.
+        "max_tokens": 1024,
         "system": system,
         "messages": [{"role": "user", "content": format!("Titre : {title}\n\n{head}")}],
     });
