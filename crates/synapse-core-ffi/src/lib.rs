@@ -654,13 +654,14 @@ impl Brain {
         today: String,
         base_url: Option<String>,
         fuel_token: Option<String>,
+        // SYN-152 — wire dialect for the classify step. None keeps the
+        // Anthropic behaviour (what iOS passes today).
+        provider: Option<String>,
     ) -> Result<String, CoreError> {
         let config = synapse_core::LlmConfig {
             model,
             api_key,
-            // Single-op classify keeps the Anthropic default; the full cycle
-            // selects a provider via LlmSettings (SYN-150).
-            provider: synapse_core::LlmProvider::Anthropic,
+            provider: synapse_core::LlmProvider::parse(provider.as_deref()),
             base_url,
             fuel_token,
             prompts_dir,
