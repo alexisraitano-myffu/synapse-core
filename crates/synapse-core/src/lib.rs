@@ -29,7 +29,7 @@ mod sync;
 
 pub use digest::next_occurrence_str;
 pub use embedder::{CoreError, Embedder, EMBEDDING_DIM};
-pub use llm::{parse_classify_text, LlmConfig};
+pub use llm::{parse_classify_text, LlmConfig, LlmProvider};
 pub use pairing::{accept as pairing_accept, open as pairing_open, seal as pairing_seal, PairingOffer, PairingSession};
 pub use pairing::{code_confirm_mac, code_confirm_verify, CodePairing};
 pub use resources::{extract_page, extract_urls, fetch_and_extract, PageText};

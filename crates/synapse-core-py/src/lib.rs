@@ -524,6 +524,7 @@ impl Brain {
         let config = synapse_core::LlmConfig {
             model: model.to_string(),
             api_key: String::new(),
+            provider: synapse_core::LlmProvider::Anthropic,
             base_url: None,
             fuel_token: None,
             prompts_dir: prompts_dir.to_string(),
@@ -556,6 +557,9 @@ impl Brain {
         let config = synapse_core::LlmConfig {
             model: model.to_string(),
             api_key: api_key.to_string(),
+            // Backend Mac path is Anthropic today; SYN-152 will expose the
+            // provider selector once the settings endpoint lands.
+            provider: synapse_core::LlmProvider::Anthropic,
             base_url: base_url.map(String::from),
             fuel_token: fuel_token.map(String::from),
             prompts_dir: prompts_dir.to_string(),
@@ -588,6 +592,9 @@ impl Brain {
         let config = synapse_core::LlmConfig {
             model: model.to_string(),
             api_key: api_key.to_string(),
+            // Backend Mac path is Anthropic today; SYN-152 will expose the
+            // provider selector once the settings endpoint lands.
+            provider: synapse_core::LlmProvider::Anthropic,
             base_url: base_url.map(String::from),
             fuel_token: fuel_token.map(String::from),
             prompts_dir: prompts_dir.to_string(),
@@ -621,6 +628,9 @@ impl Brain {
         let config = synapse_core::LlmConfig {
             model: model.to_string(),
             api_key: api_key.to_string(),
+            // Backend Mac path is Anthropic today; SYN-152 will expose the
+            // provider selector once the settings endpoint lands.
+            provider: synapse_core::LlmProvider::Anthropic,
             base_url: base_url.map(String::from),
             fuel_token: fuel_token.map(String::from),
             prompts_dir: prompts_dir.to_string(),
@@ -735,6 +745,9 @@ impl Brain {
         let config = synapse_core::LlmConfig {
             model: model.to_string(),
             api_key: api_key.to_string(),
+            // Backend Mac path is Anthropic today; SYN-152 will expose the
+            // provider selector once the settings endpoint lands.
+            provider: synapse_core::LlmProvider::Anthropic,
             base_url: base_url.map(String::from),
             fuel_token: fuel_token.map(String::from),
             prompts_dir: prompts_dir.to_string(),
@@ -849,6 +862,7 @@ fn llm_config_opt(
     model.map(|model| synapse_core::LlmConfig {
         model: model.to_string(),
         api_key: api_key.unwrap_or_default().to_string(),
+        provider: synapse_core::LlmProvider::Anthropic,
         base_url: base_url.map(String::from),
         fuel_token: fuel_token.map(String::from),
         prompts_dir: prompts_dir.unwrap_or_default().to_string(),
