@@ -271,6 +271,12 @@ pub struct LlmSettings {
     pub today: String,
     pub base_url: Option<String>,
     pub fuel_token: Option<String>,
+    /// SYN-150 wire dialect: "anthropic" (default) or "openai" — unset keeps
+    /// Anthropic, so an existing host that never sets it is unchanged. The
+    /// UniFFI default lets the current Kotlin/Swift call sites compile untouched
+    /// until SYN-152 wires the selector.
+    #[uniffi(default = None)]
+    pub provider: Option<String>,
 }
 
 impl From<LlmSettings> for synapse_core::LlmConfig {
@@ -278,6 +284,7 @@ impl From<LlmSettings> for synapse_core::LlmConfig {
         synapse_core::LlmConfig {
             model: s.model,
             api_key: s.api_key,
+            provider: synapse_core::LlmProvider::parse(s.provider.as_deref()),
             base_url: s.base_url,
             fuel_token: s.fuel_token,
             prompts_dir: s.prompts_dir,
@@ -651,6 +658,9 @@ impl Brain {
         let config = synapse_core::LlmConfig {
             model,
             api_key,
+            // Single-op classify keeps the Anthropic default; the full cycle
+            // selects a provider via LlmSettings (SYN-150).
+            provider: synapse_core::LlmProvider::Anthropic,
             base_url,
             fuel_token,
             prompts_dir,

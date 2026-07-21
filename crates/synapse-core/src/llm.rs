@@ -22,16 +22,55 @@ use serde_json::{json, Map, Value};
 use crate::embedder::CoreError;
 use crate::routing::Brain;
 
+/// Which wire dialect the host's chosen model speaks (SYN-126, open provider
+/// seam). The core stays model-agnostic: it builds ONE Anthropic-shaped request
+/// and reads ONE Anthropic-shaped response; a non-Anthropic provider is
+/// translated at the boundary in [`post_messages`], so every call site
+/// (classify, summaries, digest, resources) is unaware of the provider.
+///
+/// - `Anthropic` — Claude's Messages API (and the `syn-fuel-` proxy).
+/// - `OpenAiCompatible` — the `/v1/chat/completions` dialect spoken by OpenAI,
+///   Ollama, vLLM, LM Studio, OpenRouter… anyone the user brings their own
+///   key/endpoint for.
+///
+/// An on-device runtime (LiteRT/Gemma, SYN-155) is NOT a new wire format: it
+/// plugs in as a host-supplied backend (a UniFFI callback that bypasses HTTP
+/// entirely). That path lands on top of this seam, not inside this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LlmProvider {
+    #[default]
+    Anthropic,
+    OpenAiCompatible,
+}
+
+impl LlmProvider {
+    /// Host-facing parse (a config/UI string → enum). Unknown or `None` falls
+    /// back to `Anthropic`, so an unset field keeps today's behaviour.
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("openai") | Some("openai-compatible") | Some("openai_compatible") => {
+                Self::OpenAiCompatible
+            }
+            _ => Self::Anthropic,
+        }
+    }
+}
+
 /// Everything the host resolves about "how to call the model": key handling
 /// (incl. the fuel-proxy seam) stays host policy; the core just executes.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub model: String,
     pub api_key: String,
-    /// None → https://api.anthropic.com ; the fuel proxy passes its origin.
+    /// Which wire dialect `model` speaks. `Anthropic` by default (`LlmProvider`
+    /// derives `Default`) — an existing host that never sets it is unchanged.
+    pub provider: LlmProvider,
+    /// None → the provider's default origin (Anthropic: api.anthropic.com,
+    /// OpenAI-compatible: api.openai.com). Ollama/vLLM/etc. pass their own.
+    /// The fuel proxy passes its origin here too (Anthropic only).
     pub base_url: Option<String>,
     /// Set for `syn-fuel-` tokens: sent as `x-synapse-token`, with the
-    /// placeholder api key the proxy ignores.
+    /// placeholder api key the proxy ignores. Anthropic-only (ignored elsewhere).
     pub fuel_token: Option<String>,
     pub prompts_dir: String,
     /// Injected into the prompt (`{today}`) — Python used module-load date.
@@ -102,10 +141,32 @@ impl Brain {
     }
 }
 
-/// POST /v1/messages with the config's key/fuel-proxy routing — the single
-/// HTTP path shared by classify and the T5 summary calls. Returns the parsed
-/// response body; HTTP/network failures are `LlmHttp` (abort-the-run policy).
+/// The single LLM chokepoint shared by classify and the T5 summary calls
+/// (SYN-126): dispatch on the provider, but ALWAYS return an Anthropic-shaped
+/// body (`content[0].text` + `stop_reason`) so every caller and the response
+/// helpers ([`response_text`], [`unusable`], [`parse_classify_text`]) are
+/// provider-agnostic. HTTP/network failures are `LlmHttp` (abort-the-run policy).
 pub(crate) fn post_messages(config: &LlmConfig, params: &Value) -> Result<Value, CoreError> {
+    match config.provider {
+        LlmProvider::Anthropic => post_anthropic(config, params),
+        LlmProvider::OpenAiCompatible => post_openai(config, params),
+    }
+}
+
+/// Map a `ureq` transport/status error to `LlmHttp` (shared by both providers).
+fn http_error(e: ureq::Error) -> CoreError {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            CoreError::LlmHttp(format!("HTTP {code}: {}", &body[..body.len().min(500)]))
+        }
+        other => CoreError::LlmHttp(other.to_string()),
+    }
+}
+
+/// POST /v1/messages with the config's key/fuel-proxy routing. The request is
+/// already Anthropic-shaped and the response needs no translation.
+fn post_anthropic(config: &LlmConfig, params: &Value) -> Result<Value, CoreError> {
     let base = config
         .base_url
         .as_deref()
@@ -124,16 +185,96 @@ pub(crate) fn post_messages(config: &LlmConfig, params: &Value) -> Result<Value,
         None => request.set("x-api-key", &config.api_key),
     };
 
-    let response = request.send_string(&params.to_string()).map_err(|e| match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            CoreError::LlmHttp(format!("HTTP {code}: {}", &body[..body.len().min(500)]))
-        }
-        other => CoreError::LlmHttp(other.to_string()),
-    })?;
+    let response = request
+        .send_string(&params.to_string())
+        .map_err(http_error)?;
     response
         .into_json()
         .map_err(|e| CoreError::LlmHttp(format!("invalid response body: {e}")))
+}
+
+/// POST /v1/chat/completions (OpenAI, Ollama, vLLM, LM Studio, OpenRouter…):
+/// translate the Anthropic-shaped `params` to a chat request, then normalise the
+/// response back to the Anthropic shape. `cache_control` is dropped and
+/// `finish_reason` is mapped to `stop_reason` — the two normalisations SYN-126
+/// flagged (a foreign provider chokes on `cache_control` and never emits
+/// Anthropic's `stop_reason`, so both must be synthesised at this boundary).
+fn post_openai(config: &LlmConfig, params: &Value) -> Result<Value, CoreError> {
+    let base = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com")
+        .trim_end_matches('/');
+    let url = format!("{base}/v1/chat/completions");
+
+    let response = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(600))
+        .set("content-type", "application/json")
+        .set("authorization", &format!("Bearer {}", config.api_key))
+        .send_string(&anthropic_to_openai(config, params).to_string())
+        .map_err(http_error)?;
+    let body: Value = response
+        .into_json()
+        .map_err(|e| CoreError::LlmHttp(format!("invalid response body: {e}")))?;
+    Ok(openai_to_anthropic(&body))
+}
+
+/// Concatenate the `text` of an Anthropic content value — a bare string, or an
+/// array of blocks — into one string, dropping `cache_control` and any non-text
+/// block. The join keeps blocks readable when a system had several.
+fn flatten_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+/// Anthropic `messages.create` params → OpenAI `chat/completions` request. The
+/// `system` blocks become a leading `system` message; each user/assistant
+/// message's content is flattened to text. `cache_control` never survives (we
+/// read only `.text`).
+fn anthropic_to_openai(config: &LlmConfig, params: &Value) -> Value {
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(system) = params.get("system") {
+        let text = flatten_text(system);
+        if !text.is_empty() {
+            messages.push(json!({"role": "system", "content": text}));
+        }
+    }
+    if let Some(arr) = params.get("messages").and_then(Value::as_array) {
+        for m in arr {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+            let content = flatten_text(m.get("content").unwrap_or(&Value::Null));
+            messages.push(json!({"role": role, "content": content}));
+        }
+    }
+    json!({
+        "model": config.model,
+        "max_tokens": params.get("max_tokens").cloned().unwrap_or(json!(MAX_TOKENS)),
+        "messages": messages,
+    })
+}
+
+/// OpenAI `chat/completions` response → Anthropic-shaped body. `finish_reason`
+/// `length` is Anthropic's `max_tokens` (truncation — the guard/parse both key
+/// off it); everything else collapses to `end_turn`. A body with no usable
+/// choice yields empty text, which the `unusable`/retry path already handles.
+fn openai_to_anthropic(body: &Value) -> Value {
+    let choice = &body["choices"][0];
+    let text = choice["message"]["content"].as_str().unwrap_or("");
+    let stop_reason = match choice["finish_reason"].as_str() {
+        Some("length") => "max_tokens",
+        _ => "end_turn",
+    };
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": stop_reason,
+    })
 }
 
 /// `content[0].text` of a /v1/messages response, stripped — the plain-text
@@ -340,7 +481,10 @@ mod tests {
     /// Minimal one-shot /v1/messages stub: serves `bodies` in order, one per
     /// connection, and reports how many requests it actually received. Keeps
     /// the retry test dependency-free (no HTTP mocking crate).
-    fn stub_server(bodies: Vec<&'static str>) -> (String, std::sync::mpsc::Receiver<()>) {
+    /// Sends the FULL raw request text of each served connection back over the
+    /// channel, so tests can both count requests (`rx.iter().count()`) and
+    /// assert on the outgoing body (cache_control strip / message shape).
+    fn stub_server(bodies: Vec<&'static str>) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -383,7 +527,7 @@ mod tests {
                      content-length: {}\r\nconnection: close\r\n\r\n{payload}",
                     payload.len()
                 );
-                let _ = tx.send(());
+                let _ = tx.send(String::from_utf8_lossy(&req).to_string());
                 if i + 1 >= bodies.len() {
                     break;
                 }
@@ -393,9 +537,14 @@ mod tests {
     }
 
     fn cfg(base: String) -> LlmConfig {
+        cfg_provider(base, LlmProvider::Anthropic)
+    }
+
+    fn cfg_provider(base: String, provider: LlmProvider) -> LlmConfig {
         LlmConfig {
             model: "test".into(),
             api_key: "k".into(),
+            provider,
             base_url: Some(base),
             fuel_token: None,
             prompts_dir: String::new(),
@@ -469,5 +618,76 @@ mod tests {
             parse_classify_text("pas du json", 10, None),
             Err(CoreError::LlmContent(_))
         ));
+    }
+
+    // ── SYN-150: OpenAI-compatible provider normalisation ────────────────
+    const OA_FILLED: &str =
+        r#"{"choices":[{"message":{"content":"une fiche"},"finish_reason":"stop"}]}"#;
+    /// finish_reason=length → the OpenAI spelling of Anthropic's max_tokens.
+    const OA_CUT: &str =
+        r#"{"choices":[{"message":{"content":"une fiche coup"},"finish_reason":"length"}]}"#;
+
+    #[test]
+    fn provider_parse_defaults_to_anthropic() {
+        assert_eq!(LlmProvider::parse(None), LlmProvider::Anthropic);
+        assert_eq!(LlmProvider::parse(Some("gibberish")), LlmProvider::Anthropic);
+        assert_eq!(LlmProvider::parse(Some("anthropic")), LlmProvider::Anthropic);
+        assert_eq!(
+            LlmProvider::parse(Some(" OpenAI ")),
+            LlmProvider::OpenAiCompatible
+        );
+        assert_eq!(
+            LlmProvider::parse(Some("openai-compatible")),
+            LlmProvider::OpenAiCompatible
+        );
+    }
+
+    #[test]
+    fn openai_response_is_normalised_to_anthropic_text() {
+        let (base, _rx) = stub_server(vec![OA_FILLED]);
+        let cfg = cfg_provider(base, LlmProvider::OpenAiCompatible);
+        // A classify-style body still parses: the normalised shape carries
+        // content[0].text + stop_reason, exactly what the caller reads.
+        let body = post_messages(&cfg, &json!({})).unwrap();
+        assert_eq!(body["content"][0]["text"], "une fiche");
+        assert_eq!(body["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn openai_length_maps_to_truncation_and_is_retried() {
+        // finish_reason=length must normalise to stop_reason=max_tokens so the
+        // existing truncation guard fires — here it drives the retry.
+        let (base, rx) = stub_server(vec![OA_CUT, OA_FILLED]);
+        let cfg = cfg_provider(base, LlmProvider::OpenAiCompatible);
+        let text = post_messages_text(&cfg, &json!({})).unwrap();
+        assert_eq!(text, "une fiche", "the untruncated retry must win");
+        assert_eq!(rx.iter().count(), 2);
+    }
+
+    #[test]
+    fn openai_request_drops_cache_control_and_flattens_system() {
+        let (base, rx) = stub_server(vec![OA_FILLED]);
+        let cfg = cfg_provider(base, LlmProvider::OpenAiCompatible);
+        let params = json!({
+            "model": "ignored-cfg-wins",
+            "max_tokens": 123,
+            "system": [{"type": "text", "text": "tu es un classifieur",
+                        "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "note du jour"}],
+        });
+        post_messages(&cfg, &params).unwrap();
+        let req = rx.recv().unwrap();
+        let sent = &req[req.find("\r\n\r\n").unwrap() + 4..];
+        let sent: Value = serde_json::from_str(sent).unwrap();
+        // No Anthropic-only keys reach an OpenAI endpoint.
+        assert!(!req.contains("cache_control"), "cache_control must be stripped");
+        assert!(sent.get("system").is_none(), "system folds into messages");
+        // The config's model wins; system becomes the first message.
+        assert_eq!(sent["model"], "test");
+        assert_eq!(sent["max_tokens"], 123);
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][0]["content"], "tu es un classifieur");
+        assert_eq!(sent["messages"][1]["role"], "user");
+        assert_eq!(sent["messages"][1]["content"], "note du jour");
     }
 }
