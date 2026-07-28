@@ -79,6 +79,11 @@ fn synced_tables() -> &'static [(&'static str, &'static str)] {
         ("sync_owner", "id"),
         ("space", "id"),
         ("devices", "device_id"),
+        // SYN-160 — append-only, uuid pk. Replicated so the total covers the
+        // whole space; a row seen twice is the SAME row and upserts onto
+        // itself, so nothing is counted twice. Two devices that really made
+        // two calls keep two rows — they were really billed twice.
+        ("llm_usage", "id"),
     ]
 }
 

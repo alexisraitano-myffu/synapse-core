@@ -188,7 +188,13 @@ impl Brain {
                 "messages": [{"role": "user", "content": lines.join("\n")}],
             });
             let summary = match post_messages_text(config, &params_json) {
-                Ok(t) => t,
+                Ok((t, used)) => {
+                    // SYN-160 — la re-résumé est la passe la plus répétée du
+                    // cycle : la compter est ce qui distingue le coût réel du
+                    // coût de la seule classification.
+                    crate::usage::record(&conn, config, crate::usage::Op::Resummarize, used);
+                    t
+                }
                 // Infra failure — stop here; the stale flags survive.
                 Err(CoreError::LlmHttp(_)) => break,
                 Err(_) => continue,
@@ -348,9 +354,10 @@ fn append_project_summary(
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": user_msg}],
     });
-    let Ok(text) = post_messages_text(config, &params_json) else {
+    let Ok((text, used)) = post_messages_text(config, &params_json) else {
         return Ok(None);
     };
+    crate::usage::record(conn, config, crate::usage::Op::ProjectSummary, used);
     let summary_md = strip_fences(&text);
 
     let version_id = new_uuid();
@@ -445,9 +452,10 @@ fn refine_project_summary(
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": user_msg}],
     });
-    let Ok(text) = post_messages_text(config, &params_json) else {
+    let Ok((text, used)) = post_messages_text(config, &params_json) else {
         return Ok(None);
     };
+    crate::usage::record(conn, config, crate::usage::Op::ProjectSummary, used);
     let summary_md = strip_fences(&text);
 
     let entry_count = entries.len() as i64;

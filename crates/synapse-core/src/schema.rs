@@ -242,6 +242,26 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             last_seen  TIMESTAMP,
             revoked_at TIMESTAMP
         )",
+        // SYN-160 — one row per LLM call. The four token buckets stay
+        // separate because they are priced differently (a cache write costs
+        // more than plain input, a cache read a tenth): collapsing them here
+        // would throw away the only thing that makes a price computable later.
+        // `day` is stored rather than derived so a month can be summed without
+        // parsing timestamps, and `device_id` says who actually paid.
+        "CREATE TABLE IF NOT EXISTS llm_usage (
+            id                 TEXT PRIMARY KEY,
+            occurred_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            day                DATE NOT NULL,
+            device_id          TEXT,
+            provider           TEXT NOT NULL,
+            model              TEXT NOT NULL,
+            operation          TEXT NOT NULL,
+            input_tokens       INTEGER NOT NULL DEFAULT 0,
+            output_tokens      INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens  INTEGER NOT NULL DEFAULT 0
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_llm_usage_day ON llm_usage (day)",
     ];
 
     for stmt in creates {

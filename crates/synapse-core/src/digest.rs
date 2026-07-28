@@ -267,7 +267,16 @@ impl Brain {
             "messages": [{"role": "user", "content": format!(
                 "Matière de la semaine (semaine du {week_start}) :\n\n{payload}")}],
         });
-        let text = post_messages_text(config, &params_json)?;
+        // SYN-160 — le digest porte le prompt et la sortie les plus longs du
+        // cycle : c'est ici que le coût réel se joue, pas sur la classification.
+        let (text, used) = post_messages_text(config, &params_json)?;
+        {
+            // Le verrou n'est pris qu'ici, après l'appel réseau : cette passe
+            // tourne hors transaction hôte (règle Brain), et le garder pendant
+            // le LLM déclencherait des SQLITE_BUSY sur le chemin capture.
+            let conn = self.storage.lock()?;
+            crate::usage::record(&conn, config, crate::usage::Op::Digest, used);
+        }
         if text.is_empty() {
             return Err(CoreError::LlmContent("digest: réponse du modèle vide".into()));
         }

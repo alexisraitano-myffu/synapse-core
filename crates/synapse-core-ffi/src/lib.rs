@@ -380,6 +380,14 @@ impl SqlConnection {
         Ok(self.inner.generated_for_capture(&capture_id)?.to_string())
     }
 
+    /// SYN-160 — consumption of `month` (`YYYY-MM`) as JSON: tokens per
+    /// operation and model, captures processed, and how many days carry data
+    /// (the host needs that last one to decide whether a projection means
+    /// anything). No price: converting to money is host policy.
+    pub fn usage_summary(&self, month: String) -> Result<String, CoreError> {
+        Ok(self.inner.usage_summary(&month)?.to_string())
+    }
+
     /// SYN-135 — apply one app action-log entry (validate/archive/rename/
     /// relation CRUD/merge accept/…) to this local db, mirroring the desktop
     /// backend's write endpoints. Own IMMEDIATE transaction; returns the

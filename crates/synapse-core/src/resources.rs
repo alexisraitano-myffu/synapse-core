@@ -272,13 +272,22 @@ pub fn fetch_and_extract(url: &str, timeout: Duration) -> Option<PageText> {
 /// LLM summary of the extracted text (prompt = data `resource-summary.md`).
 /// Falls back to a truncated snippet without a config (offline) or on any
 /// LLM/prompt failure — a resource is always storable.
-fn summarize(config: Option<&LlmConfig>, title: &str, text: &str) -> String {
+/// SYN-160 — renvoie aussi ce que l'appel a consommé. L'écriture du compteur
+/// n'a PAS lieu ici : le contrat de cette fonction est de ne tenir aucun verrou
+/// pendant le réseau et le LLM. L'appelant l'enregistre sur la connexion qu'il
+/// prend déjà pour l'INSERT.
+fn summarize(
+    config: Option<&LlmConfig>,
+    title: &str,
+    text: &str,
+) -> (String, crate::usage::LlmUsage) {
     let snippet: String = text.chars().take(300).collect();
+    let none = crate::usage::LlmUsage::default();
     let Some(config) = config else {
-        return snippet;
+        return (snippet, none);
     };
     let Ok(system) = load_prompt(&config.prompts_dir, "resource-summary.md") else {
-        return snippet;
+        return (snippet, none);
     };
     let head: String = text.chars().take(8000).collect();
     let params_json = json!({
@@ -290,8 +299,10 @@ fn summarize(config: Option<&LlmConfig>, title: &str, text: &str) -> String {
     });
     match post_messages_text(config, &params_json) {
         // Still empty after the retry — fall back to the extracted snippet.
-        Ok(t) if !t.is_empty() => t,
-        _ => snippet,
+        // The call was billed either way, so its usage travels back regardless.
+        Ok((t, used)) if !t.is_empty() => (t, used),
+        Ok((_, used)) => (snippet, used),
+        Err(_) => (snippet, none),
     }
 }
 
@@ -320,7 +331,7 @@ impl Brain {
         let Some(page) = fetch_and_extract(url, FETCH_TIMEOUT) else {
             return Ok(None);
         };
-        let summary = summarize(config, &page.title, &page.text);
+        let (summary, used) = summarize(config, &page.title, &page.text);
         // Multi-frame blob (SYN-118): a long summary embeds per window and the
         // resource scorer keeps the best frame.
         let embedding = self.embed_frames(&format!("{}\n{}", page.title, summary));
@@ -330,6 +341,9 @@ impl Brain {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         let conn = self.storage.lock()?;
+        if let Some(config) = config {
+            crate::usage::record(&conn, config, crate::usage::Op::Resource, used);
+        }
         conn.execute(
             "INSERT INTO resources (id, type, source, url, title, content, summary, \
              embedding, fetched_at) VALUES (?1,'url',?2,?3,?4,?5,?6,?7,?8)",

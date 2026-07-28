@@ -26,6 +26,7 @@ mod sql;
 mod storage;
 mod summaries;
 mod sync;
+mod usage;
 
 pub use digest::next_occurrence_str;
 pub use embedder::{CoreError, Embedder, EMBEDDING_DIM};
@@ -36,3 +37,5 @@ pub use resources::{extract_page, extract_urls, fetch_and_extract, PageText};
 pub use routing::{Brain, ProjectSynthesis, RouteContext, RouteReport};
 pub use sql::{connect, SqlConnection, SqlResult, SqlValue};
 pub use storage::{EntityHit, NoteHit, ResourceHit, Storage};
+// SYN-160 — consommation réelle des appels LLM (tokens, jamais un prix).
+pub use usage::{usage_summary, LlmUsage, Op as LlmOp};

@@ -215,6 +215,15 @@ impl SqlConnection {
         crate::snapshot::read_snapshot(&conn)
     }
 
+    /// SYN-160 — what the LLM calls of `month` (`YYYY-MM`) consumed, split by
+    /// operation and model. TOKENS only, never a price: the tariff, who holds
+    /// the key and who actually pays are host concerns, and a wrong figure is
+    /// worse than no figure.
+    pub fn usage_summary(&self, month: &str) -> Result<serde_json::Value, CoreError> {
+        let conn = self.lock()?;
+        crate::usage::usage_summary(&conn, month)
+    }
+
     /// SYN-132 — reverse provenance of one capture (`/capture/{id}/generated`).
     pub fn generated_for_capture(&self, capture_id: &str) -> Result<serde_json::Value, CoreError> {
         let conn = self.lock()?;

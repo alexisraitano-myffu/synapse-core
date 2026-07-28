@@ -21,6 +21,7 @@ use serde_json::{json, Map, Value};
 
 use crate::embedder::CoreError;
 use crate::routing::Brain;
+use crate::usage::LlmUsage;
 
 /// Which wire dialect the host's chosen model speaks (SYN-126, open provider
 /// seam). The core stays model-agnostic: it builds ONE Anthropic-shaped request
@@ -169,6 +170,13 @@ impl Brain {
     ) -> Result<Value, CoreError> {
         let params = self.build_classify_params(content, day_context, config)?;
         let body = post_messages(config, &params)?;
+        // SYN-160 — recorded before parsing: the call is billed whether or not
+        // its JSON turns out to be usable, so a parse failure must not make the
+        // spending disappear from the books.
+        {
+            let conn = self.storage.lock()?;
+            crate::usage::record(&conn, config, crate::usage::Op::Classify, LlmUsage::from_body(&body));
+        }
         let text = body["content"][0]["text"].as_str().unwrap_or("");
         let stop_reason = body["stop_reason"].as_str();
         parse_classify_text(text, content.chars().count(), stop_reason)
@@ -372,17 +380,27 @@ fn unusable(body: &Value, text: &str) -> bool {
 /// (see [`unusable`]). Callers keep the same contract as `response_text` — an
 /// empty string is still possible once the retries are spent, and stays the
 /// caller's problem.
-pub(crate) fn post_messages_text(config: &LlmConfig, params: &Value) -> Result<String, CoreError> {
+/// SYN-160 — the tuple is deliberate. Returning the usage forces every call
+/// site to say what it spent and under which operation; a signature that let
+/// callers ignore it would drift back to "we only measure classify", which is
+/// exactly the blind spot the ticket set out to remove. A retried call bills
+/// twice, so both attempts are summed into the returned usage.
+pub(crate) fn post_messages_text(
+    config: &LlmConfig,
+    params: &Value,
+) -> Result<(String, LlmUsage), CoreError> {
     let mut body = post_messages(config, params)?;
     let mut text = response_text(&body);
+    let mut usage = LlmUsage::from_body(&body);
     for _ in 0..EMPTY_RETRIES {
         if !unusable(&body, &text) {
             break;
         }
         body = post_messages(config, params)?;
         text = response_text(&body);
+        usage = usage.add(LlmUsage::from_body(&body));
     }
-    Ok(text)
+    Ok((text, usage))
 }
 
 /// Read a prompt file from `prompts_dir`, dropping the trailing newline so
@@ -630,7 +648,7 @@ mod tests {
     #[test]
     fn thinking_that_ate_the_budget_is_retried() {
         let (base, rx) = stub_server(vec![THOUGHT_AWAY, FILLED]);
-        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        let (text, _) = post_messages_text(&cfg(base), &json!({})).unwrap();
         assert_eq!(text, "une fiche");
         assert_eq!(rx.iter().count(), 2);
     }
@@ -639,7 +657,7 @@ mod tests {
     fn truncated_but_non_empty_is_also_retried() {
         // The old empty-only guard let this through: partial text, silently stored.
         let (base, rx) = stub_server(vec![CUT, FILLED]);
-        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        let (text, _) = post_messages_text(&cfg(base), &json!({})).unwrap();
         assert_eq!(text, "une fiche", "a summary cut mid-sentence is not a summary");
         assert_eq!(rx.iter().count(), 2);
     }
@@ -647,7 +665,7 @@ mod tests {
     #[test]
     fn empty_generation_is_retried_once() {
         let (base, rx) = stub_server(vec![EMPTY, FILLED]);
-        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        let (text, _) = post_messages_text(&cfg(base), &json!({})).unwrap();
         assert_eq!(text, "une fiche", "the retry's text must win");
         assert_eq!(rx.iter().count(), 2, "exactly one retry");
     }
@@ -655,7 +673,7 @@ mod tests {
     #[test]
     fn non_empty_generation_is_not_retried() {
         let (base, rx) = stub_server(vec![FILLED]);
-        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        let (text, _) = post_messages_text(&cfg(base), &json!({})).unwrap();
         assert_eq!(text, "une fiche");
         assert_eq!(rx.iter().count(), 1, "no retry when the first call is useful");
     }
@@ -665,7 +683,7 @@ mod tests {
         // Contract: retries are bounded — callers still handle the empty case
         // (summaries keeps summary_stale=1, resources falls back to a snippet).
         let (base, rx) = stub_server(vec![EMPTY, EMPTY]);
-        let text = post_messages_text(&cfg(base), &json!({})).unwrap();
+        let (text, _) = post_messages_text(&cfg(base), &json!({})).unwrap();
         assert!(text.is_empty());
         assert_eq!(rx.iter().count(), 2, "bounded at EMPTY_RETRIES, no loop");
     }
@@ -725,7 +743,7 @@ mod tests {
         // existing truncation guard fires — here it drives the retry.
         let (base, rx) = stub_server(vec![OA_CUT, OA_FILLED]);
         let cfg = cfg_provider(base, LlmProvider::OpenAiCompatible);
-        let text = post_messages_text(&cfg, &json!({})).unwrap();
+        let (text, _) = post_messages_text(&cfg, &json!({})).unwrap();
         assert_eq!(text, "une fiche", "the untruncated retry must win");
         assert_eq!(rx.iter().count(), 2);
     }
