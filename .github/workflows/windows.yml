@@ -17,6 +17,14 @@ concurrency:
 
 env:
   MODEL_REPO: qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q
+  # LNK2038 sur l'image windows-latest depuis le 14/07 (MSVC 14.51 / VS 18) :
+  # esaxx-rs (dep C++ de tokenizers, via fastembed) force `.static_crt(true)`
+  # => /MT, alors que le binaire ONNX Runtime prebuilt telecharge par ort-sys
+  # est en /MD. Le CRT dynamique est le defaut de tout le reste (et ce que
+  # CPython attend), donc on aligne esaxx dessus. `cc` applique les flags
+  # d'environnement en DERNIER, ils ecrasent donc le -MT du build script.
+  CFLAGS: /MD
+  CXXFLAGS: /MD
 
 jobs:
   test-and-wheel:
