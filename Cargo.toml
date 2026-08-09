@@ -22,7 +22,15 @@ repository = "https://github.com/alexisraitano-myffu/synapse-core"
 synapse-core = { path = "crates/synapse-core" }
 fastembed = { version = "5.17", default-features = false }
 # Already in the tree via fastembed; used directly for SYN-118 chunk windowing.
-tokenizers = "0.22"
+# Les features doivent rester le MIROIR EXACT de celles que fastembed declare
+# (`default-features = false, features = ["onig"]`) : l'unification des features
+# de Cargo est additive, donc une declaration plus large ici rallume les
+# features pour fastembed aussi. Les defauts de tokenizers tirent `esaxx_fast`
+# => `esaxx-rs/cpp`, un objet C++ compile en CRT statique (/MT) qui n'entre en
+# jeu que pour l'ENTRAINEMENT BPE (on ne fait que de l'inference) et qui refuse
+# de linker avec le binaire ONNX Runtime prebuilt de ort-sys, en /MD
+# (LNK2038 sur windows-latest depuis MSVC 14.51). Voir SYN-147.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # bundled: the same SQLite compiled into the core on every platform (macOS,
