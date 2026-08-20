@@ -119,12 +119,37 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      STEP / COMMITMENT ("declare my income to the tax office", "send the invoice to efcsn"; FR:
      "déclarer mes revenus à l'URSSAF") = TASK, even phrased in two words or in the imperative /
      2nd person. NEVER settle for extracting facts about the named entities while dropping the action.
+     WHOSE TASK IS IT — a task belongs to the person who must act, and that is not always the author.
+     Reported speech gives the action to someone else: "Marie told me she had to call the dentist"
+     (FR: "Marie m'a dit qu'elle devait appeler le dentiste") is MARIE's action, not the author's.
+     Emit the note and make it mention Marie, so it lands on her fiche — never turn it into a task
+     the author will believe is theirs. The author is named in the AUTHOR block: first person always
+     means them, and only them.
+     A CANCELLED action creates NOTHING to do: "I'm finally not going to call the dentist" (FR: "je
+     ne vais finalement pas appeler le dentiste") must NEVER yield kind="task". Keep the decision as
+     kind="note" — deciding against something is itself worth remembering.
  (e) DATED EVENT (kind="event"): an occurrence that HAPPENS on a date — appointment, trade show,
      birthday, calendar deadline. Task vs event: an event you ATTEND / it HAPPENS to you (passive);
      a task you DO (active). "Vivatech trade show on the 24th" → event; "prepare the demo for the
      show" → task. event_date = ABSOLUTE date (resolve "Tuesday" via {today}).
-     Birthday / yearly recurrence → event_recurring=true (and ALSO emit the has_birthday fact on the
-     person). A past event being recounted ("yesterday I saw X") is NOT an event — only upcoming or
+     THE PRESENCE OF A VERB IS NOT THE TEST — attending or having something is also a verb. Ask who
+     acts on what: "call the dentist", "remind me to…", "send the invoice" = the author acts ON
+     something → TASK. "I'm going to Vivatech on the 12th", "I have Pierre's party on the 20th",
+     "dentist appointment Tuesday" = the author attends an occurrence → EVENT, verb or not.
+     BIRTHDAYS — the DEFAULT is an event note. Only one wording removes it:
+       · a CELEBRATION is named (party, drinks, dinner, "we're celebrating") → event note,
+         event_recurring=true, full confidence. This is an occurrence to attend, nothing to hesitate
+         about.
+       · a bare anniversary date ("12 June is Yanis's birthday") → STILL emit the event note
+         (recurring) AND the has_birthday fact, but lower classification_confidence below 0.6: it is
+         undecidable whether the author wants the date remembered or a gathering attended, and the
+         low confidence sends the note to human arbitration. Never resolve it by dropping the note —
+         a fact alone reaches no validation queue, and the question would be silently answered.
+       · ONLY a stated BIRTH with no anniversary framing ("born on 3 March", "born in 1990") → the
+         has_birthday fact on the person, no event note. A birth date is durable knowledge.
+     This split NEVER weakens the MIXED CAPTURE rule below: a birthday surrounded by facts and
+     relations still yields its event note, with everything else.
+     A past event being recounted ("yesterday I saw X") is NOT an event — only upcoming or
      recurring occurrences are.
      HARD RULE — a dated occurrence stated as a bare noun phrase with NO verb ("Vivatech on the
      24th", "dentist appointment Tuesday"; FR: "Salon Vivatech le 24", "Rendez-vous mardi") MUST
@@ -175,6 +200,9 @@ build/renovate Y, organize a trip). A TASK is a single bounded action ("call the
 - The project is an UMBRELLA: later sub-tasks and progress in the domain attach to it via
   project_entries rather than living as isolated tasks.
 - A genuine isolated action, with no obvious parent project, stays kind="task" (cf. rule (d)).
+- A capture that FOUNDS a project also deserves its note: emit the project_entry AND an atomic_note
+  carrying what was said, so the project opens with a first entry instead of an empty shell. The note
+  is the founding statement, not a task to perform.
 
 project_entries rules:
 - If the capture is explicitly tied to ONE OR MORE projects (declared or named), produce ONE entry per
@@ -220,6 +248,11 @@ persistence_value rules:
 3 = current state (ongoing project)
 2 = contextual (one-off event)
 1 = noise (passing mention)
+This ladder is what decides whether something DESERVES a node, animals included. A pet that lives
+with someone ("my cat is called Gipsy") is a lasting presence → 4-5, so it becomes an entity. An
+animal crossed once ("I saw a bear at the zoo called Balthazar") is a passing mention → 1, so it
+stays inside the episode and gets no node. Same for people, places and objects: persistence, not
+whether a proper noun happens to be present.
 
 evidence_strength rules (apply to the capture's language, FR/EN/other):
 explicit = fact stated directly, no uncertainty marker
@@ -228,6 +261,14 @@ hedged   = epistemic uncertainty marker present (EN: "seems", "I think", "appare
            same criterion in any other language)
 implicit = fact not stated but inferred from context (indirect inference, e.g. Pierre's move is
            discussed without saying where to)
+
+NO INVENTION — a fact states what the capture says, never what you know about the world:
+Never enrich, never complete, never generalise. "Marie has a cat named Gipsy" says the cat's NAME and
+its OWNER, and nothing else — no breed, no age, no species detail the sentence does not carry. If a
+value does not appear in the capture, the fact does not exist. When a capture is thin, emit fewer
+facts; an invented fact is worse than a missing one, because nothing in the system will ever
+contradict it. This applies to facts, relations and attributes alike — the timeless rule already
+governs summaries, and it governs the graph too.
 
 fact vs relation rule (anti-duplication):
 A RELATION links two NAMED ENTITIES; a FACT describes an entity by a LITERAL value.
