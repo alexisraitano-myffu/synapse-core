@@ -295,7 +295,7 @@ fn summarize(
         // SYN-124 — 2-4 phrases demandées + marge de raisonnement, cf. summaries::resummarize.
         "max_tokens": 1024,
         "system": system,
-        "messages": [{"role": "user", "content": format!("Titre : {title}\n\n{head}")}],
+        "messages": [{"role": "user", "content": format!("Title: {title}\n\n{head}")}],
     });
     match post_messages_text(config, &params_json) {
         // Still empty after the retry — fall back to the extracted snippet.

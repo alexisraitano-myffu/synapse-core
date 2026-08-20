@@ -137,11 +137,11 @@ impl Brain {
             let name = e.get("canonical_name").and_then(Value::as_str).unwrap_or("");
             let etype = e.get("type").and_then(Value::as_str).unwrap_or("");
             let mut lines = vec![format!(
-                "Entité : {name}{}",
+                "Entity: {name}{}",
                 if etype.is_empty() { String::new() } else { format!(" (type {etype})") }
             )];
             if !facts.is_empty() {
-                lines.push("Faits :".to_string());
+                lines.push("Facts:".to_string());
                 for f in &facts {
                     lines.push(format!(
                         "- {} : {}",
@@ -151,7 +151,7 @@ impl Brain {
                 }
             }
             if !relations.is_empty() {
-                lines.push("Relations :".to_string());
+                lines.push("Relations:".to_string());
                 for r in &relations {
                     lines.push(format!(
                         "- {} → {}",
@@ -302,7 +302,7 @@ fn project_facts_block(conn: &Connection, project_id: &str) -> Result<Option<Str
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Some(format!(
-        "Faits actifs du projet (données durables à refléter fidèlement dans la synthèse) :\n{lines}"
+        "Faits actifs du projet (durable data, to be reflected verbatim in the synthesis):\n{lines}"
     )))
 }
 
@@ -337,13 +337,13 @@ fn append_project_summary(
         .unwrap_or_default();
     let user_msg = match &current_summary {
         Some(cur) => format!(
-            "Projet : {project_name}\n\nSynthèse actuelle :\n---\n{cur}\n---\n\n\
-             Nouvelle entrée à intégrer :\n---\n{new_entry_content}\n---{facts_block}\n\n\
-             Mets à jour la synthèse pour intégrer la nouvelle entrée."
+            "Project: {project_name}\n\nCurrent synthesis:\n---\n{cur}\n---\n\n\
+             New entry to integrate:\n---\n{new_entry_content}\n---{facts_block}\n\n\
+             Update the synthesis to integrate the new entry."
         ),
         None => format!(
-            "Projet : {project_name}\n\nPremière entrée :\n---\n{new_entry_content}\n---{facts_block}\n\n\
-             Écris la synthèse initiale du projet à partir de cette entrée."
+            "Project: {project_name}\n\nFirst entry:\n---\n{new_entry_content}\n---{facts_block}\n\n\
+             Write the project's initial synthesis from this entry."
         ),
     };
 
@@ -440,9 +440,9 @@ fn refine_project_summary(
         .map(|b| format!("\n\n{b}"))
         .unwrap_or_default();
     let user_msg = format!(
-        "Projet : {project_name}\n\n\
-         Toutes les entrées dans l'ordre chronologique :\n---\n{timeline}\n---{facts_block}\n\n\
-         Reconstruis from-scratch la synthèse du projet."
+        "Project: {project_name}\n\n\
+         All entries in chronological order:\n---\n{timeline}\n---{facts_block}\n\n\
+         Rebuild the project synthesis from scratch."
     );
 
     let params_json = json!({

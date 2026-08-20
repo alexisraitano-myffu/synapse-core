@@ -177,10 +177,14 @@ pub(crate) fn gather_week(
             continue;
         }
         upcoming.push(json!({
+            // SYN-119 — EN-base like every other skeleton string: this title
+            // travels INTO the digest payload, and a French label in English
+            // material pushes the renderer toward French (mesuré sur Gemma E2B).
+            // The prompt renders it in the material's dominant language.
             "title": if name.is_empty() {
-                "Anniversaire".to_string()
+                "Birthday".to_string()
             } else {
-                format!("Anniversaire de {name}")
+                format!("Birthday: {name}")
             },
             "content": Value::Null,
             "kind": "birthday",
@@ -265,7 +269,7 @@ impl Brain {
             "max_tokens": 3072,
             "system": system,
             "messages": [{"role": "user", "content": format!(
-                "Matière de la semaine (semaine du {week_start}) :\n\n{payload}")}],
+                "Material for the week of {week_start}:\n\n{payload}")}],
         });
         // SYN-160 — le digest porte le prompt et la sortie les plus longs du
         // cycle : c'est ici que le coût réel se joue, pas sur la classification.
