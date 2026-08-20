@@ -136,7 +136,12 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      "I went climbing with Théo", "I called the plumber"). EMIT THE NOTE. What was lived is what a
      memory is made of, and an episode nobody wrote down is simply lost.
      THE PAST TENSE IS NOT THE TEST — read the ACTION, not the tense:
-      · it happened, and it involves someone, somewhere, or some doing → kind="episode".
+      · it happened AND there is something in it to come back to — another PERSON, a PLACE
+        worth naming, an OUTCOME, a first time → kind="episode".
+      · a solitary routine chore or errand, with nobody and nowhere in it ("I bought bread",
+        "I did the dishes", "I took the bins out") → NO note. It was lived, but nothing in it
+        will ever be worth resurfacing. It is still NOT is_ephemeral: it is DONE, not pending —
+        marking it so would resurrect it as a reminder to do what is already done.
       · it happened AND establishes something durable ("I called the plumber, he's coming Tuesday")
         → emit the episode AND the fact/event it establishes. The two coexist; neither replaces
         the other.
