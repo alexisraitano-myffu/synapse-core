@@ -131,6 +131,11 @@ jobs:
           path: |
             target/SynapseCore.xcframework
             target/swift
+          # Ce workflow tourne à chaque push sur main : avec la rétention par défaut
+          # (90 j), 39 xcframeworks quasi identiques (~90 Mo pièce) dormaient encore
+          # en août et saturaient le stockage Actions du compte. La release roulante
+          # ci-dessous est le canal durable ; l'artefact n'est qu'une commodité.
+          retention-days: 7
 
       # abi3 macOS wheel: lets any macOS CI (the app repo's iOS E2E job runs
       # the public backend on its runner) pip-install the core without a

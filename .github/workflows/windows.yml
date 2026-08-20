@@ -71,6 +71,9 @@ jobs:
           name: synapse-core-wheel-windows
           path: target/wheels/*.whl
           if-no-files-found: error
+          # Cf. ios.yml : rétention par défaut = 90 j et un push sur main par build.
+          # La release roulante juste en dessous est le canal durable.
+          retention-days: 7
 
       # Rolling release consumed by the (private) app repo's Windows
       # distribution workflow — same pattern as core-ios on ios.yml.
