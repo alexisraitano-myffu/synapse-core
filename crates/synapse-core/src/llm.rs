@@ -471,8 +471,8 @@ fn active_types_block(conn: &rusqlite::Connection) -> Result<String, CoreError> 
         types = FALLBACK_TYPES.iter().map(|s| s.to_string()).collect();
     }
     Ok(format!(
-        "[TYPES D'ENTITÉ ACTIFS — choisis EXACTEMENT l'un d'eux pour `type`]\n{}\n\
-         Aucun ne convient ? → type=\"concept\" + type_proposal \
+        "[ACTIVE ENTITY TYPES — pick EXACTLY one of these for `type`]\n{}\n\
+         None fits? → type=\"concept\" + type_proposal \
          {{\"value\": \"<type_snake>\", \"reason\": \"...\"}}.",
         types.join(", ")
     ))
@@ -494,12 +494,12 @@ fn active_projects_block(conn: &rusqlite::Connection) -> Result<String, CoreErro
         })?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.is_empty() {
-        return Ok("[PROJETS EXISTANTS]\n(aucun pour l'instant — toute mention de \
-                   'nouveau projet : X' doit créer l'entité)"
+        return Ok("[EXISTING PROJECTS]\n(none yet — any mention of 'new project: X' \
+                   must create the entity)"
             .to_string());
     }
     let mut lines =
-        vec!["[PROJETS EXISTANTS — utilise leur canonical_name exact pour le rattachement]"
+        vec!["[EXISTING PROJECTS — use their exact canonical_name to attach]"
             .to_string()];
     for (name, summary, aliases) in rows {
         let aliases: Vec<String> = aliases
@@ -548,16 +548,17 @@ fn owner_block(conn: &rusqlite::Connection) -> Result<Option<String>, CoreError>
     let alias_str = if aliases.is_empty() {
         String::new()
     } else {
-        format!(" (alias : {})", aliases.join(", "))
+        format!(" (aliases: {})", aliases.join(", "))
     };
     Ok(Some(format!(
-        "[AUTEUR — l'utilisateur de ce second cerveau]\n\
-         L'auteur des captures est « {name} »{alias_str}. Toute référence à la PREMIÈRE \
-         PERSONNE (je, j', me, m', moi, mon, ma, mes, le mien/la mienne…) le désigne. \
-         Utilise EXACTEMENT le canonical_name « {name} » comme entité pour les faits et \
-         relations le concernant — ex : « Romain est mon frère » → relation \
-         (Romain, is_sibling_of, {name}) ; « j'habite à Lyon » → fact (lives_in, Lyon) sur \
-         « {name} ». Ne crée JAMAIS d'entité générique « auteur », « Auteur », « User » ou « moi »."
+        "[AUTHOR — the user of this second brain]\n\
+         The author of the captures is \"{name}\"{alias_str}. Any FIRST-PERSON reference \
+         designates them — EN: I, me, my, mine, myself; FR: je, j', me, m', moi, mon, ma, mes, \
+         le mien/la mienne. Use EXACTLY the canonical_name \"{name}\" as the entity for facts \
+         and relations about them — e.g. \"Romain is my brother\" (FR: « Romain est mon frère ») \
+         → relation (Romain, is_sibling_of, {name}); \"I live in Lyon\" (FR: « j'habite à Lyon ») \
+         → fact (lives_in, Lyon) on \"{name}\". NEVER create a generic entity \"author\", \
+         \"Author\", \"User\" or \"me\"."
     )))
 }
 

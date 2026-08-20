@@ -136,9 +136,12 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      "I went climbing with Théo", "I called the plumber"). EMIT THE NOTE. What was lived is what a
      memory is made of, and an episode nobody wrote down is simply lost.
      THE PAST TENSE IS NOT THE TEST — read the ACTION, not the tense:
-      · it happened AND there is something in it to come back to — another PERSON, a PLACE
-        worth naming, an OUTCOME, a first time → kind="episode".
-      · a solitary routine chore or errand, with nobody and nowhere in it ("I bought bread",
+      · ANOTHER NAMED PERSON IS IN IT → kind="episode", always, no matter how ordinary the
+        activity. A meal, a coffee, a walk, a phone call: "I had dinner at Léa's yesterday"
+        (FR: "j'ai mangé chez Léa hier") IS an episode — shared time with someone is exactly
+        what a personal memory exists to hold. Do not weigh whether it was interesting.
+      · no other person, but a PLACE worth naming, an OUTCOME, or a FIRST TIME → kind="episode".
+      · a solitary routine chore or errand — nobody, nowhere, nothing achieved ("I bought bread",
         "I did the dishes", "I took the bins out") → NO note. It was lived, but nothing in it
         will ever be worth resurfacing. It is still NOT is_ephemeral: it is DONE, not pending —
         marking it so would resurrect it as a reminder to do what is already done.
@@ -167,10 +170,13 @@ is_ephemeral policy — do NOT drop durable thoughts:
 DEFAULT is_ephemeral=false. Set it true ONLY for a trivial expiring errand: something still TO DO,
 with NO durable content, NO named addressee, NO commitment and NO date ("buy bread"; FR: "acheter du
 pain"). All four must be absent at once. Any one of them present ⇒ is_ephemeral=false.
-NO ACTION STILL TO DO ⇒ is_ephemeral=false, always. A link, a statement, a reported sentence, an
-anniversary leave you nothing to run after: no errand, so nothing to put on a 48h timer. Ask "what
-must I go and DO in the next two days?" — no answer means false. This decides is_ephemeral ONLY; it
-never suppresses an atomic_note, and an already-lived action still gets its episode note (f).
+is_ephemeral=true REQUIRES A VERB OF ACTION IN THE INFINITIVE OR IMPERATIVE, aimed at the author,
+naming something they must go and DO ("buy bread", "call back", "pick up the parcel"). No such verb
+in the capture ⇒ is_ephemeral=false, mechanically, without weighing anything else. A URL, a
+statement, a reported sentence, an anniversary, a past action: none of them carries one, so none of
+them is ever ephemeral — a link is not a chore, and putting it on a 48h timer files a reminder to
+run an errand that does not exist. This decides is_ephemeral ONLY; it never suppresses an
+atomic_note, and an already-lived action still gets its episode note (f).
 is_ephemeral=true marks a GENUINELY expiring short-term errand/reminder (~48h TTL), NOT a durable
 thought. A reflective note (criteria a/b/c) is DURABLE → set is_ephemeral=false. is_ephemeral=true
 may coexist with an atomic_note ONLY for a task/event (d/e) — the reminder now + the durable note.
