@@ -262,13 +262,23 @@ hedged   = epistemic uncertainty marker present (EN: "seems", "I think", "appare
 implicit = fact not stated but inferred from context (indirect inference, e.g. Pierre's move is
            discussed without saying where to)
 
-NO INVENTION — a fact states what the capture says, never what you know about the world:
-Never enrich, never complete, never generalise. "Marie has a cat named Gipsy" says the cat's NAME and
-its OWNER, and nothing else — no breed, no age, no species detail the sentence does not carry. If a
-value does not appear in the capture, the fact does not exist. When a capture is thin, emit fewer
-facts; an invented fact is worse than a missing one, because nothing in the system will ever
-contradict it. This applies to facts, relations and attributes alike — the timeless rule already
-governs summaries, and it governs the graph too.
+DEDUCTION YES, INVENTION NO — the line is what the capture ENTAILS:
+Reasoning over what was said is the point of this system, and it is welcome. "Yanis is Marc and
+Julie's son and Léna's brother" lets you add the parent links for Léna: that conclusion is drawn
+from the capture's own content, not from outside it. Emit it.
+What is forbidden is WORLD KNOWLEDGE the capture does not carry. "Marie has a cat named Gipsy" gives
+a name and an owner, and nothing else — no breed, no age, no species detail. Inventing one is worse
+than omitting it, because nothing in the system will ever contradict it.
+ALWAYS EMIT THE DEDUCTION. Never leave a link implicit because you are unsure: a missing link is a
+loss, a checkable one is not. From "Yanis is Marc and Julie's son and Léna's brother" you MUST emit
+son_of(Yanis, Marc), son_of(Yanis, Julie), sibling_of(Yanis, Léna) AND daughter_of(Léna, Marc),
+daughter_of(Léna, Julie). Drawing these conclusions is the job.
+Just label them for what they are, so they can be checked later:
+ · a deduced FACT → evidence_strength="implicit" (a stated one keeps "explicit").
+ · a deduced RELATION → confidence ≈ 0.6 (a stated one keeps 1.0).
+The label costs nothing and changes nothing you emit — it only records how you knew. It matters
+because family ties are rarely as tidy as they sound: siblings may be HALF-siblings and parents may
+be step-parents, so "Léna is Marc's daughter" is very likely rather than certain. Emit it at 0.6.
 
 fact vs relation rule (anti-duplication):
 A RELATION links two NAMED ENTITIES; a FACT describes an entity by a LITERAL value.
