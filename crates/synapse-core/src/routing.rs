@@ -232,8 +232,7 @@ impl Brain {
 
         let mut report = RouteReport::default();
 
-        let is_ephemeral = truthy(classified.get("is_ephemeral"))
-            || classified.get("input_type").and_then(Value::as_str) == Some("ephemeral");
+        let is_ephemeral = truthy(classified.get("is_ephemeral"));
         let note_kind = classified
             .get("atomic_note_kind")
             .and_then(Value::as_str)
@@ -1457,8 +1456,7 @@ fn handle_intentions(
         "DELETE FROM intentions WHERE created_at < ?1 AND resolved = 0",
         params![ctx.intentions_cutoff],
     )?;
-    let is_ephemeral = truthy(classified.get("is_ephemeral"))
-        || classified.get("input_type").and_then(Value::as_str) == Some("ephemeral");
+    let is_ephemeral = truthy(classified.get("is_ephemeral"));
     if is_ephemeral {
         let source = classified
             .get("ephemeral_content")
@@ -1964,7 +1962,6 @@ mod tests {
         let entry = json!({"id": "c1", "content": "Je me demande si je devrais arrêter le café"});
         let classified = json!({
             "language": "fr",
-            "input_type": "episodic",
             "atomic_note": "Je me demande si je devrais arrêter le café",
             "atomic_note_kind": "note",
             "is_ephemeral": false,

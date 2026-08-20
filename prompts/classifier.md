@@ -4,7 +4,7 @@ Detect the capture's language and echo it as `language` (ISO 639-1: fr, en, es, 
 LANGUAGE POLICY — two independent layers, never conflate them:
  • Natural-language fields you WRITE (atomic_note, summary, entity `summary`, project `content`,
    ephemeral_content) MUST be in the SAME language as the capture. Never translate the user's words.
- • The graph SKELETON stays English, ALWAYS, whatever the capture language: `input_type`,
+ • The graph SKELETON stays English, ALWAYS, whatever the capture language:
    `atomic_note_kind`, entity `type`, fact/relation `predicate` (snake_case: works_at, lives_in,
    has_birthday, sibling_of, cousin_of), and `category`. Predicates/types are an interlingua, not prose.
 
@@ -17,7 +17,6 @@ event/task/note that the same sentence also states.
 Return ONLY valid JSON (no markdown):
 {
   "language": "ISO 639-1 code of the capture's language (e.g. \"fr\", \"en\")",
-  "input_type": "fact|episodic|ephemeral|resource",
   "atomic_note": "string or null (free / non-factual thought kept as its own node that MENTIONS entities without becoming one). WRITE IT IN THE CAPTURE'S LANGUAGE.",
   "atomic_note_kind": "note|task|event|episode (qualifies a non-null atomic_note; default: note)",
   "event_date": "YYYY-MM-DD or null (ABSOLUTE date — for an event: the occurrence date; for a task: its deadline if any)",
@@ -61,37 +60,6 @@ Return ONLY valid JSON (no markdown):
   "ephemeral_content": null,
   "classification_confidence": 1.0
 }
-
-input_type rules — the capture's NATURE, not its routing:
-input_type says WHAT THE CAPTURE IS. It is ORTHOGONAL to atomic_note / is_ephemeral / entities: a
-capture can be `episodic` AND yield facts, entities and project_entries — extracting facts FROM a
-lived episode never changes its nature. Pick EXACTLY ONE, first match wins:
- - "resource": the capture centers on an external link/document to ingest (URL, article, video,
-   paper), even when the author comments on it.
- - "ephemeral": a trivial expiring errand with NO durable content and no addressee, commitment or
-   date ("buy bread"; FR: "acheter du pain"). Mirrors is_ephemeral=true with atomic_note=null.
- - "episodic": the AUTHOR recounts something THEY did, lived or experienced — first person, a moment
-   in time, routine or not, with or without an outcome. "I climbed with Alexis today and sent my
-   6b+", "went for a run this morning, felt good", "I worked on Synapse today" (FR: "j'ai été
-   escalader…", "j'ai mangé chez Léa hier").
-   HARD RULE — "I did / ate / saw / went / worked on / tried X" (first person + past lived action)
-   is ALWAYS input_type="episodic", NEVER "fact", even when the sentence also asserts something true
-   ("and I succeeded", "it went well") and even when it produces facts or project_entries. A lived
-   episode is not durable knowledge about the world: it belongs to the author's timeline.
-   The action must be ALREADY LIVED. First person alone is not enough: an intention, an obligation
-   or a plan ("I have to prepare the demo", "I need to call X", "I'm going to learn Japanese";
-   FR: "je dois préparer…", "je veux apprendre…") has not happened yet — it is NOT episodic. Route
-   it on its own merits (task / project), and leave input_type="fact".
- - "fact": durable state asserted about someone/something ELSE, with no lived-episode framing
-   ("Marie has a cat named Gipsy", "Pierre works at Acme", "Audric is Alexis's cousin", "Léa
-   probably adopted a dog"). Also the default when nothing above applies (e.g. a pure reflection).
-Discriminator: does the sentence answer "what happened to me?" (→ episodic) or "what is true about
-X?" (→ fact)? First person + past action + a moment ⇒ episodic, ALWAYS.
-CLOSED SET — `input_type` accepts ONLY these four values, never any other. If you are tempted to
-answer "task", "note" or "event", those are `atomic_note_kind` values, a DIFFERENT field: keep
-`input_type` inside the closed set AND emit the atomic_note with its proper kind. Narrowing
-`input_type` NEVER suppresses an atomic_note, an entity or a fact — the routing rules below apply
-unchanged, in particular the HARD RULE that an action to do always yields kind="task".
 
 atomic_note rules:
 An atomic_note is a THOUGHT of the author that should be able to resurface later (insight, idea,
@@ -153,7 +121,7 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      recurring occurrences are. It is an EPISODE (f), and it still gets its note.
      HARD RULE — a dated occurrence stated as a bare noun phrase with NO verb ("Vivatech on the
      24th", "dentist appointment Tuesday"; FR: "Salon Vivatech le 24", "Rendez-vous mardi") MUST
-     STILL yield atomic_note != null AND atomic_note_kind="event" — NEVER a bare episodic mention
+     STILL yield atomic_note != null AND atomic_note_kind="event" — NEVER a bare mention
      that drops the note. Rule of thumb: a date + an occurrence ⇒ an event note, even in two words.
      IMPORTANT: emit the atomic_note kind="event" EVEN IF is_ephemeral=true — the short-term reminder
      (intention) and the durable event coexist in the same JSON.
@@ -174,6 +142,10 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
         the other.
       · it is stated only to report a current state ("I've already eaten", "I'm done with the
         dishes") → no note. Nothing was lived worth keeping, only a status.
+     THE ACTION MUST BE ALREADY LIVED. First person alone is not enough: an intention, an
+     obligation or a plan ("I have to prepare the demo", "I need to call X", "I'm going to learn
+     Japanese"; FR: "je dois préparer…", "je veux apprendre…") has NOT happened yet — it is not an
+     episode. Route it on its own merits: task (d) or project.
      AN EPISODE NEEDS A WHEN. A habit or a biographical trait carries no situated moment ("I played
      piano as a child", "I used to run every morning"; FR: "je faisais du piano quand j'étais
      petit") → NOT an episode: that is durable knowledge about the author, so emit the FACT. Never
@@ -187,6 +159,13 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      inside a memory — the lived half survives in the facts and entities the capture also yields.
 
 is_ephemeral policy — do NOT drop durable thoughts:
+DEFAULT is_ephemeral=false. Set it true ONLY for a trivial expiring errand: something still TO DO,
+with NO durable content, NO named addressee, NO commitment and NO date ("buy bread"; FR: "acheter du
+pain"). All four must be absent at once. Any one of them present ⇒ is_ephemeral=false.
+NO ACTION STILL TO DO ⇒ is_ephemeral=false, always. A link, a statement, a reported sentence, an
+anniversary leave you nothing to run after: no errand, so nothing to put on a 48h timer. Ask "what
+must I go and DO in the next two days?" — no answer means false. This decides is_ephemeral ONLY; it
+never suppresses an atomic_note, and an already-lived action still gets its episode note (f).
 is_ephemeral=true marks a GENUINELY expiring short-term errand/reminder (~48h TTL), NOT a durable
 thought. A reflective note (criteria a/b/c) is DURABLE → set is_ephemeral=false. is_ephemeral=true
 may coexist with an atomic_note ONLY for a task/event (d/e) — the reminder now + the durable note.
@@ -262,7 +241,7 @@ entity type rules:
   create a project: when in doubt → "type": "concept".
 
 classification_confidence rule (0.0–1.0):
-Rate your confidence in the chosen ROUTING (input_type / atomic_note_kind / is_ephemeral).
+Rate your confidence in the chosen ROUTING (atomic_note / atomic_note_kind / is_ephemeral).
 - 1.0 = unambiguous. ~0.9 = clear. < 0.6 = you genuinely hesitate (e.g. a minimal action you're unsure
   deserves a durable task, or a cryptic / truncated capture).
 - When hesitating on "durable action vs ephemeral": do NOT drop — pick atomic_note_kind="task" and
