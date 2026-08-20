@@ -1528,7 +1528,7 @@ fn persist_atomic_note(
     review_status: &str,
     language: Option<&str>,
 ) -> Result<String, CoreError> {
-    let kind = if ["note", "task", "event"].contains(&kind) { kind } else { "note" };
+    let kind = if ["note", "task", "event", "episode"].contains(&kind) { kind } else { "note" };
     let review_status = if ["confirmed", "pending"].contains(&review_status) {
         review_status
     } else {

@@ -28,6 +28,22 @@ fn tau_default() -> f64 {
         .unwrap_or(30.0)
 }
 
+/// SYN-171 — a lived episode ("j'ai déjeuné avec Manon") is worth keeping, but
+/// not at the weight of a note or a task: it is what happened, not what to do
+/// or what holds. It fades on a shorter τ (10 days vs 30, so it sits near 0.05
+/// after a month where a note is still at 0.37) and is never deleted — the
+/// weaker score sinks it in search and in the retrospective, which is the whole
+/// mechanism. `SYNAPSE_DECAY_TAU_EPISODE_DAYS` overrides it.
+fn tau_for_kind(kind: Option<&str>, tau: f64) -> f64 {
+    if kind != Some("episode") {
+        return tau;
+    }
+    std::env::var("SYNAPSE_DECAY_TAU_EPISODE_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(tau / 3.0)
+}
+
 fn now_naive_utc() -> NaiveDateTime {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -94,15 +110,16 @@ pub(crate) fn apply_decay(
     now: NaiveDateTime,
 ) -> Result<i64, CoreError> {
     let tau = tau_days.unwrap_or_else(tau_default);
-    let rows: Vec<(String, Option<String>, Option<String>)> = {
+    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
         let mut stmt =
-            conn.prepare("SELECT id, created_at, last_reactivated_at FROM atomic_notes")?;
-        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            conn.prepare("SELECT id, created_at, last_reactivated_at, kind FROM atomic_notes")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         mapped.collect::<Result<_, _>>()?
     };
     let n = rows.len() as i64;
-    for (id, created, reactivated) in rows {
+    for (id, created, reactivated, kind) in rows {
         let base = anchor(reactivated.as_deref(), created.as_deref(), now);
+        let tau = tau_for_kind(kind.as_deref(), tau);
         conn.execute(
             "UPDATE atomic_notes SET memory_strength = ?1 WHERE id = ?2",
             params![strength(base, now, tau), id],
@@ -246,5 +263,39 @@ mod tests {
             })
             .unwrap();
         assert_eq!(moved, "2026-05-16 12:00:00");
+    }
+
+    /// A lived episode is kept, not deleted — it simply stops competing with a
+    /// note for attention. Same law, shorter τ.
+    #[test]
+    fn an_episode_fades_faster_than_a_note() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE atomic_notes (id TEXT PRIMARY KEY, created_at TEXT, \
+             last_reactivated_at TEXT, memory_strength REAL, entities_mentioned TEXT, kind TEXT)",
+        )
+        .unwrap();
+        for (id, kind) in [("n1", "note"), ("e1", "episode"), ("t1", "task")] {
+            conn.execute(
+                "INSERT INTO atomic_notes (id, created_at, kind) VALUES (?1, '2026-05-01 12:00:00', ?2)",
+                params![id, kind],
+            )
+            .unwrap();
+        }
+        apply_decay(&conn, Some(30.0), ts("2026-05-31 12:00:00")).unwrap();
+        let strength_of = |id: &str| -> f64 {
+            conn.query_row(
+                "SELECT memory_strength FROM atomic_notes WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Note and task keep the shared law: 30 days at τ=30 → e⁻¹.
+        assert!((strength_of("n1") - (-1.0f64).exp()).abs() < 1e-9);
+        assert!((strength_of("t1") - (-1.0f64).exp()).abs() < 1e-9);
+        // The episode ran three times the elapsed τ → e⁻³, still far from zero.
+        assert!((strength_of("e1") - (-3.0f64).exp()).abs() < 1e-9);
+        assert!(strength_of("e1") > 0.0, "un épisode s'efface, il ne disparaît pas");
     }
 }

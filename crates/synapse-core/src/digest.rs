@@ -77,7 +77,7 @@ pub(crate) fn gather_week(
         conn,
         "SELECT title, content, kind FROM atomic_notes \
          WHERE created_at >= ?1 AND archived_at IS NULL \
-         AND kind IN ('note', 'task', 'event') AND review_status != 'pending' \
+         AND kind IN ('note', 'task', 'event', 'episode') AND review_status != 'pending' \
          ORDER BY created_at DESC LIMIT ?2",
         &[SqlV::from(since.clone()), SqlV::from(MAX_NOTES)],
     )?;

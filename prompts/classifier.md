@@ -19,7 +19,7 @@ Return ONLY valid JSON (no markdown):
   "language": "ISO 639-1 code of the capture's language (e.g. \"fr\", \"en\")",
   "input_type": "fact|episodic|ephemeral|resource",
   "atomic_note": "string or null (free / non-factual thought kept as its own node that MENTIONS entities without becoming one). WRITE IT IN THE CAPTURE'S LANGUAGE.",
-  "atomic_note_kind": "note|task|event (qualifies a non-null atomic_note; default: note)",
+  "atomic_note_kind": "note|task|event|episode (qualifies a non-null atomic_note; default: note)",
   "event_date": "YYYY-MM-DD or null (ABSOLUTE date — for an event: the occurrence date; for a task: its deadline if any)",
   "event_recurring": false,
   "project_entries": [
@@ -150,7 +150,7 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      This split NEVER weakens the MIXED CAPTURE rule below: a birthday surrounded by facts and
      relations still yields its event note, with everything else.
      A past event being recounted ("yesterday I saw X") is NOT an event — only upcoming or
-     recurring occurrences are.
+     recurring occurrences are. It is an EPISODE (f), and it still gets its note.
      HARD RULE — a dated occurrence stated as a bare noun phrase with NO verb ("Vivatech on the
      24th", "dentist appointment Tuesday"; FR: "Salon Vivatech le 24", "Rendez-vous mardi") MUST
      STILL yield atomic_note != null AND atomic_note_kind="event" — NEVER a bare episodic mention
@@ -163,18 +163,44 @@ Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
      July 23", event_recurring=true) AND the has_birthday fact on Nadia AND the daughter_of/sibling_of
      relations. The surrounding context is NEVER a reason to route the capture as facts-only and drop
      the event note.
+ (f) LIVED EPISODE (kind="episode"): something that HAPPENED, recounted for having happened — an
+     outing, a meal, a meeting, a trip, a call that took place ("yesterday I had lunch with Manon",
+     "I went climbing with Théo", "I called the plumber"). EMIT THE NOTE. What was lived is what a
+     memory is made of, and an episode nobody wrote down is simply lost.
+     THE PAST TENSE IS NOT THE TEST — read the ACTION, not the tense:
+      · it happened, and it involves someone, somewhere, or some doing → kind="episode".
+      · it happened AND establishes something durable ("I called the plumber, he's coming Tuesday")
+        → emit the episode AND the fact/event it establishes. The two coexist; neither replaces
+        the other.
+      · it is stated only to report a current state ("I've already eaten", "I'm done with the
+        dishes") → no note. Nothing was lived worth keeping, only a status.
+     AN EPISODE NEEDS A WHEN. A habit or a biographical trait carries no situated moment ("I played
+     piano as a child", "I used to run every morning"; FR: "je faisais du piano quand j'étais
+     petit") → NOT an episode: that is durable knowledge about the author, so emit the FACT. Never
+     let an episode note take a biographical fact's place.
+     An episode is NEVER is_ephemeral: it does not expire in 48h, it fades on its own.
+     Progress on a project stays a project_entry (PROJECT vs TASK rule below), not an episode.
+     A PENDING ACTION OUTRANKS THE EPISODE. One capture yields exactly ONE atomic_note: when it
+     recounts something lived AND names something still to do ("I called the dentist this morning,
+     I need to call back Thursday"; FR: "j'ai appelé le dentiste ce matin, il faut que je rappelle
+     jeudi"), the note is the TASK (d), with its date. What is still owed must never be buried
+     inside a memory — the lived half survives in the facts and entities the capture also yields.
 
 is_ephemeral policy — do NOT drop durable thoughts:
 is_ephemeral=true marks a GENUINELY expiring short-term errand/reminder (~48h TTL), NOT a durable
 thought. A reflective note (criteria a/b/c) is DURABLE → set is_ephemeral=false. is_ephemeral=true
 may coexist with an atomic_note ONLY for a task/event (d/e) — the reminder now + the durable note.
 A kind="note" reflection must NEVER be marked is_ephemeral=true (it would be silently lost).
+AN ERRAND ALREADY DONE IS NEVER is_ephemeral. "I bought bread this morning" (FR: "j'ai acheté du pain
+ce matin") is something LIVED, not something to do — it is an EPISODE (f). is_ephemeral=true only
+ever describes an action still PENDING; putting a done errand there resurrects it as a reminder.
 
 Otherwise atomic_note = null. In particular, atomic_note = null for ALL these cases:
  - "X has/is/does Y" → fact about X ("Karim has a project called Atlas", "Marie has a cat Gipsy",
    "Léa probably adopted a dog", "my mother has a new cat").
- - "I did/ate/saw/worked on …" → lived episode (input_type="episodic"), goes to inbox +
-   entities/facts, not atomic_note (unless the author explicitly draws a reflection from it, cf. (a)).
+ - A past action reported ONLY as a status, with nothing lived in it ("I've already eaten", "that's
+   sent") → entities/facts if any, no note. Anything actually LIVED is an EPISODE (f), which does
+   get its note.
  - Project progress report ("I made progress on X today, tested Y") → project_entries, not atomic_note
    (unless an explicit reflection is added).
  - Trivial micro-errand, WITHOUT an addressee or stakes, WITHOUT durable content or a date ("I need to
