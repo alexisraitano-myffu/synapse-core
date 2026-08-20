@@ -38,16 +38,56 @@ const PROJECT_ATTACH_THRESHOLD_DEFAULT: f64 = 0.30;
 const PROJECT_ATTACH_MARGIN_DEFAULT: f64 = 0.03;
 const REVIEW_CONFIDENCE_THRESHOLD_DEFAULT: f64 = 0.7;
 
-const SINGLE_VALUED_PREDICATES: &[&str] = &[
-    "works_at", "current_workplace", "employer",
-    "lives_in", "current_city", "lives", "address",
-    "has_birthday", "birthday", "born_on", "date_of_birth",
-    "phone", "phone_number", "email",
-    "age", "job_title", "current_role", "role",
+/// Predicates that hold at most one live value, grouped by the claim they
+/// make. A new value supersedes the previous one across the whole family:
+/// `birthday` and `has_birthday` are one claim under two names, and letting
+/// them sit side by side puts two contradictory dates on the same fiche.
+const SINGLE_VALUED_FAMILIES: &[&[&str]] = &[
+    &["works_at", "current_workplace", "employer"],
+    &["lives_in", "current_city", "lives", "address"],
+    &["has_birthday", "birthday", "born_on", "date_of_birth"],
+    &["phone", "phone_number"],
+    &["email"],
+    &["age"],
+    &["job_title", "current_role", "role"],
 ];
+
+/// The family `predicate` belongs to, if any. Members are lowercase ASCII
+/// identifiers — [`insert_fact`] interpolates them into SQL on that basis.
+fn single_valued_family(predicate: &str) -> Option<&'static [&'static str]> {
+    let p = predicate.trim().to_lowercase();
+    SINGLE_VALUED_FAMILIES
+        .iter()
+        .copied()
+        .find(|family| family.contains(&p.as_str()))
+}
 
 const DATE_PREDICATE_KEYWORDS: &[&str] =
     &["birthday", "birth", "date", "born", "anniversary", "anniversaire"];
+
+/// Predicates whose date can only lie in the past: nobody is born, and no
+/// anniversary is commemorated, on a day that has not happened yet. Narrower
+/// than [`DATE_PREDICATE_KEYWORDS`] on purpose — a bare `date` (a deadline, a
+/// next appointment) is legitimately in the future.
+const PAST_ONLY_PREDICATE_KEYWORDS: &[&str] =
+    &["birthday", "birth", "born", "anniversary", "anniversaire"];
+
+/// Month names the classifier realistically emits — FR and EN, accented or
+/// not, full or abbreviated. Index = month number − 1.
+const MONTH_NAMES: [&[&str]; 12] = [
+    &["janvier", "january", "jan"],
+    &["février", "fevrier", "february", "feb", "fev"],
+    &["mars", "march", "mar"],
+    &["avril", "april", "apr", "avr"],
+    &["mai", "may"],
+    &["juin", "june", "jun"],
+    &["juillet", "july", "jul", "juil"],
+    &["août", "aout", "august", "aug"],
+    &["septembre", "september", "sep", "sept"],
+    &["octobre", "october", "oct"],
+    &["novembre", "november", "nov"],
+    &["décembre", "decembre", "december", "dec"],
+];
 
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
@@ -299,10 +339,15 @@ impl Brain {
                     &mentioned,
                     capture_id,
                     &note_kind,
+                    // Same normalisation as the fact side: `next_occurrence`
+                    // parses ISO strictly, so an event dated "12 juin" never
+                    // reaches a notification at all.
                     classified
                         .get("event_date")
                         .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty()),
+                        .filter(|s| !s.is_empty())
+                        .map(|s| resolve_date(s, &ctx.today))
+                        .as_deref(),
                     truthy(classified.get("event_recurring")),
                     review_status,
                     language,
@@ -543,9 +588,10 @@ impl Brain {
             for fact in arr(entity_data.get("facts")) {
                 let mut fact = fact.clone();
                 let predicate = fact.get("predicate").and_then(Value::as_str).unwrap_or("");
-                if DATE_PREDICATE_KEYWORDS.iter().any(|kw| predicate.contains(kw)) {
+                let lowered = predicate.to_lowercase();
+                if DATE_PREDICATE_KEYWORDS.iter().any(|kw| lowered.contains(kw)) {
                     if let Some(v) = fact.get("value").and_then(Value::as_str) {
-                        let resolved = resolve_date(v, &ctx.today);
+                        let resolved = resolve_fact_date(v, predicate, &ctx.today);
                         if let Value::Object(m) = &mut fact {
                             m.insert("value".into(), Value::String(resolved));
                         }
@@ -1322,15 +1368,22 @@ pub(crate) fn insert_fact(
         )?;
         return Ok(dup_id);
     }
-    if SINGLE_VALUED_PREDICATES.contains(&predicate.trim().to_lowercase().as_str()) {
+    if let Some(family) = single_valued_family(predicate) {
+        // Family members are lowercase ASCII identifiers declared above — no
+        // caller-supplied text reaches this string.
+        let list = family
+            .iter()
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(",");
         let existing: Vec<(String, Option<f64>)> = {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, confidence FROM facts \
-                 WHERE entity_id = ?1 AND predicate = ?2 \
+                 WHERE entity_id = ?1 AND LOWER(TRIM(predicate)) IN ({list}) \
                  AND obsoleted_at IS NULL AND archived_at IS NULL",
-            )?;
+            ))?;
             let rows = stmt
-                .query_map(params![entity_id, predicate], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map(params![entity_id], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
@@ -1680,21 +1733,100 @@ fn resolve_date(value: &str, today: &str) -> String {
     } {
         return add_days_iso(today, days);
     }
+    // "12 juin", "June 12, 1990", "3 mars 1990". A yearless date takes the
+    // current year, like the "07-04" case above: `digest::next_occurrence`
+    // reads the month and day only, so the year is an anchor, not a claim.
+    if let Some((m, d, y)) = parse_month_name_date(v) {
+        let year = y.unwrap_or_else(|| today[0..4].parse().unwrap_or(1970));
+        if d <= month_len(year, m as i64) as u32 {
+            return format!("{year:04}-{m:02}-{d:02}");
+        }
+    }
     value.to_string()
+}
+
+/// "12 juin" / "June 12, 1990" → (month, day, year?). Deliberately narrow:
+/// this normalises the shapes a classifier actually returns, and bails out on
+/// anything else rather than guessing. A value it cannot read is left as the
+/// model wrote it — visibly unresolved beats silently wrong.
+fn parse_month_name_date(value: &str) -> Option<(u32, u32, Option<i64>)> {
+    let lower = value.to_lowercase();
+    let (mut month, mut day, mut year) = (None, None, None);
+    for token in lower.split(|c: char| !c.is_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(idx) = MONTH_NAMES.iter().position(|names| names.contains(&token)) {
+            if month.replace(idx as u32 + 1).is_some() {
+                return None; // two month names — not a date we understand
+            }
+            continue;
+        }
+        // "1st", "2nd", "12th" — the ordinal suffix carries nothing.
+        let digits = token.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            // A stray article is noise; an unknown word means we misread the value.
+            if matches!(token, "le" | "de" | "du" | "the" | "of") {
+                continue;
+            }
+            return None;
+        }
+        match digits.len() {
+            4 if year.replace(digits.parse().ok()?).is_none() => {}
+            1 | 2 if day.replace(digits.parse().ok()?).is_none() => {}
+            _ => return None,
+        }
+    }
+    let (m, d) = (month?, day?);
+    (1..=31).contains(&d).then_some((m, d, year))
+}
+
+/// Fact-side date normalisation. On top of [`resolve_date`], a past-only
+/// predicate landing in the future is re-anchored backwards: the model
+/// resolved "le 23 juillet" to *next* year's occurrence, and storing 2027 as
+/// someone's birth year states something plainly false on their fiche.
+/// Rolling an anniversary forward is `digest::next_occurrence`'s job and it
+/// reads month and day only, so moving the year back costs no notification.
+fn resolve_fact_date(value: &str, predicate: &str, today: &str) -> String {
+    let resolved = resolve_date(value, today);
+    let p = predicate.to_lowercase();
+    if !PAST_ONLY_PREDICATE_KEYWORDS.iter().any(|kw| p.contains(kw)) {
+        return resolved;
+    }
+    if resolved.len() != 10 || resolved.as_str() <= today {
+        return resolved;
+    }
+    let (m, d) = (
+        resolved[5..7].parse::<i64>().unwrap_or(0),
+        resolved[8..10].parse::<i64>().unwrap_or(0),
+    );
+    let mut year: i64 = today[0..4].parse().unwrap_or(0);
+    if format!("{year:04}-{m:02}-{d:02}").as_str() > today {
+        year -= 1;
+    }
+    // 29 February only exists on a leap year; re-anchoring it would produce a
+    // date chrono refuses to parse, which would cost the notification outright.
+    if d > month_len(year, m) {
+        return resolved;
+    }
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
+fn leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn month_len(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if leap(y) { 29 } else { 28 },
+        _ => 0,
+    }
 }
 
 /// Day arithmetic on an ISO `YYYY-MM-DD` string (Gregorian, no deps).
 fn add_days_iso(date: &str, days: i64) -> String {
-    fn leap(y: i64) -> bool {
-        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-    }
-    fn month_len(y: i64, m: i64) -> i64 {
-        match m {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            _ => if leap(y) { 29 } else { 28 },
-        }
-    }
     let (mut y, mut m, mut d) = (
         date[0..4].parse::<i64>().unwrap_or(1970),
         date[5..7].parse::<i64>().unwrap_or(1),
@@ -1744,6 +1876,56 @@ mod tests {
         assert_eq!(resolve_date("next week", "2026-07-04"), "2026-07-11");
         assert_eq!(resolve_date("bientôt", "2026-07-04"), "bientôt");
         assert_eq!(add_days_iso("2026-12-28", 7), "2027-01-04");
+    }
+
+    /// A month name left unresolved is not cosmetic: `digest::next_occurrence`
+    /// parses ISO strictly, so "June 12" on a fiche is a birthday that never
+    /// reaches a notification.
+    #[test]
+    fn month_names_resolve_in_both_languages() {
+        let today = "2026-08-20";
+        assert_eq!(resolve_date("12 juin", today), "2026-06-12");
+        assert_eq!(resolve_date("June 12", today), "2026-06-12");
+        assert_eq!(resolve_date("3 mars 1990", today), "1990-03-03");
+        assert_eq!(resolve_date("March 3, 1990", today), "1990-03-03");
+        assert_eq!(resolve_date("le 1er août", today), "2026-08-01");
+        assert_eq!(resolve_date("décembre 25", today), "2026-12-25");
+        // Out of range, unparseable, or ambiguous → left exactly as written.
+        assert_eq!(resolve_date("31 février", today), "31 février");
+        assert_eq!(resolve_date("un jour de juin", today), "un jour de juin");
+        assert_eq!(resolve_date("entre mars et avril", today), "entre mars et avril");
+    }
+
+    /// Asked on 20 August about a birthday "le 23 juillet", the model answers
+    /// with next year's occurrence — which stored as a birth year says the
+    /// person will be born in 2027.
+    #[test]
+    fn a_birth_date_is_never_in_the_future() {
+        let today = "2026-08-20";
+        assert_eq!(resolve_fact_date("2027-07-23", "has_birthday", today), "2026-07-23");
+        // Still ahead after re-anchoring to this year → the year before.
+        assert_eq!(resolve_fact_date("2027-12-25", "birthday", today), "2025-12-25");
+        // A real birth year is a claim, not an anchor: it stays.
+        assert_eq!(resolve_fact_date("1990-03-03", "has_birthday", today), "1990-03-03");
+        // 29 February survives only on a leap year — moving it would make the
+        // date unparseable, which costs the notification outright.
+        assert_eq!(resolve_fact_date("2028-02-29", "has_birthday", today), "2028-02-29");
+        // A deadline or a next appointment is legitimately ahead of us.
+        assert_eq!(resolve_fact_date("2027-07-23", "next_meeting_date", today), "2027-07-23");
+    }
+
+    #[test]
+    fn single_valued_predicates_group_by_the_claim_they_make() {
+        let birthday = single_valued_family("has_birthday").unwrap();
+        assert!(birthday.contains(&"birthday"));
+        assert!(birthday.contains(&"date_of_birth"));
+        // Same family whichever synonym the model reached for, and casing or
+        // stray whitespace must not open a second lane.
+        assert_eq!(single_valued_family(" Birthday "), Some(birthday));
+        // Multi-valued predicates keep accumulating.
+        assert!(single_valued_family("likes").is_none());
+        // Distinct claims stay distinct: a phone must not supersede an email.
+        assert_ne!(single_valued_family("phone"), single_valued_family("email"));
     }
 
     #[test]

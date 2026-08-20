@@ -189,6 +189,22 @@ impl Brain {
 /// helpers ([`response_text`], [`unusable`], [`parse_classify_text`]) are
 /// provider-agnostic. HTTP/network failures are `LlmHttp` (abort-the-run policy).
 pub(crate) fn post_messages(config: &LlmConfig, params: &Value) -> Result<Value, CoreError> {
+    // SYN-171 — the cycle is a classifier, not a writer: sampling buys nothing
+    // and costs reproducibility. Left unset, the same capture took different
+    // routing branches between two runs, which made every parity measurement
+    // argue with itself. A caller that wants sampling can still pass its own.
+    let owned;
+    let params = match params.get("temperature") {
+        Some(_) => params,
+        None => {
+            let mut p = params.clone();
+            if let Value::Object(m) = &mut p {
+                m.insert("temperature".into(), json!(0));
+            }
+            owned = p;
+            &owned
+        }
+    };
     match config.provider {
         LlmProvider::Anthropic => post_anthropic(config, params),
         LlmProvider::OpenAiCompatible => post_openai(config, params),
@@ -326,11 +342,15 @@ fn anthropic_to_openai(config: &LlmConfig, params: &Value) -> Value {
             messages.push(json!({"role": role, "content": content}));
         }
     }
-    json!({
+    let mut out = json!({
         "model": config.model,
         "max_tokens": params.get("max_tokens").cloned().unwrap_or(json!(MAX_TOKENS)),
         "messages": messages,
-    })
+    });
+    if let (Some(t), Value::Object(m)) = (params.get("temperature"), &mut out) {
+        m.insert("temperature".into(), t.clone());
+    }
+    out
 }
 
 /// OpenAI `chat/completions` response → Anthropic-shaped body. `finish_reason`
