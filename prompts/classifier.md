@@ -62,163 +62,140 @@ Return ONLY valid JSON (no markdown):
 }
 
 atomic_note rules:
-An atomic_note is a THOUGHT of the author that should be able to resurface later (insight, idea,
-striking quote, decision). It is NOT a report of a routine event nor a factual assertion about others.
+An atomic_note is what a capture leaves behind to resurface later. Exactly ONE per capture, or
+none. `project_entries`, `entities`, `facts` and `relations` are SEPARATE axes: emitting them
+never suppresses the note, and the note never suppresses them.
 
-Emit atomic_note ONLY if AT LEAST ONE positive criterion holds:
- (a) Reflective first person: "I think that…", "I realized that…", "I wonder whether…", "I'm going to
-     try to…", "I want to stop…" (FR: "je pense que…", "j'ai réalisé que…", "je me demande si…",
-     "je veux arrêter de…").
- (b) Quote or reference to an external work / author / idea the author takes a stance on
-     ("Schopenhauer says X, but I find Y").
- (c) Non-actionable contemplative observation: "funny how…", "I noticed that…" (FR: "c'est marrant
-     comme…", "j'ai remarqué que…") — a general intuition that doesn't reduce to a fact about a person.
- (d) TASK / BACKLOG (kind="task"): a thing TO DO whose CONTENT deserves to be found again — a backlog
-     idea, an improvement to make, a step to take ("we should add a note type in projects…", "remember
-     to propose X to Y"). Often attached to a project (emit the project_entry TOO). kind="task" even if
-     the phrasing is reflective ("I need to…" actionable → task, not note).
-     A task MAY carry a deadline: if it has a due date ("finish the deck by Friday", "call the dentist
-     before the 20th"), keep kind="task" AND fill event_date (ABSOLUTE date). A dated task is NOT an
-     event — it's a thing to do, not an occurrence that happens.
-     HARD RULE — any capture that is an ACTION TO DO must yield atomic_note != null AND
-     atomic_note_kind="task" (NEVER null, NEVER is_ephemeral alone). An action ADDRESSED to a named
-     person/organization ("reply to Vincent's email", "present the business plan to Ziyu"; FR:
-     "répondre à l'e-mail de Vincent", "parler à Vincent de l'appartement"), or an ADMINISTRATIVE
-     STEP / COMMITMENT ("declare my income to the tax office", "send the invoice to efcsn"; FR:
-     "déclarer mes revenus à l'URSSAF") = TASK, even phrased in two words or in the imperative /
-     2nd person. NEVER settle for extracting facts about the named entities while dropping the action.
-     WHOSE TASK IS IT — a task belongs to the person who must act, and that is not always the author.
-     Reported speech gives the action to someone else: "Marie told me she had to call the dentist"
-     (FR: "Marie m'a dit qu'elle devait appeler le dentiste") is MARIE's action, not the author's.
-     Emit the note and make it mention Marie, so it lands on her fiche — never turn it into a task
-     the author will believe is theirs. The author is named in the AUTHOR block: first person always
-     means them, and only them.
-     A CANCELLED action creates NOTHING to do: "I'm finally not going to call the dentist" (FR: "je
-     ne vais finalement pas appeler le dentiste") must NEVER yield kind="task". Keep the decision as
-     kind="note" — deciding against something is itself worth remembering.
- (e) DATED EVENT (kind="event"): an occurrence that HAPPENS on a date — appointment, trade show,
-     birthday, calendar deadline. Task vs event: an event you ATTEND / it HAPPENS to you (passive);
-     a task you DO (active). "Vivatech trade show on the 24th" → event; "prepare the demo for the
-     show" → task. event_date = ABSOLUTE date (resolve "Tuesday" via {today}).
-     THE PRESENCE OF A VERB IS NOT THE TEST — attending or having something is also a verb. Ask who
-     acts on what: "call the dentist", "remind me to…", "send the invoice" = the author acts ON
-     something → TASK. "I'm going to Vivatech on the 12th", "I have Pierre's party on the 20th",
-     "dentist appointment Tuesday" = the author attends an occurrence → EVENT, verb or not.
-     BIRTHDAYS — the DEFAULT is an event note. Only one wording removes it:
-       · a CELEBRATION is named (party, drinks, dinner, "we're celebrating") → event note,
-         event_recurring=true, full confidence. This is an occurrence to attend, nothing to hesitate
-         about.
-       · a bare anniversary date ("12 June is Yanis's birthday") → STILL emit the event note
-         (recurring) AND the has_birthday fact, but lower classification_confidence below 0.6: it is
-         undecidable whether the author wants the date remembered or a gathering attended, and the
-         low confidence sends the note to human arbitration. Never resolve it by dropping the note —
-         a fact alone reaches no validation queue, and the question would be silently answered.
-       · ONLY a stated BIRTH with no anniversary framing ("born on 3 March", "born in 1990") → the
-         has_birthday fact on the person, no event note. A birth date is durable knowledge.
-     This split NEVER weakens the MIXED CAPTURE rule below: a birthday surrounded by facts and
-     relations still yields its event note, with everything else.
-     A past event being recounted ("yesterday I saw X") is NOT an event — only upcoming or
-     recurring occurrences are. It is an EPISODE (f), and it still gets its note.
-     HARD RULE — a dated occurrence stated as a bare noun phrase with NO verb ("Vivatech on the
-     24th", "dentist appointment Tuesday"; FR: "Salon Vivatech le 24", "Rendez-vous mardi") MUST
-     STILL yield atomic_note != null AND atomic_note_kind="event" — NEVER a bare mention
-     that drops the note. Rule of thumb: a date + an occurrence ⇒ an event note, even in two words.
-     IMPORTANT: emit the atomic_note kind="event" EVEN IF is_ephemeral=true — the short-term reminder
-     (intention) and the durable event coexist in the same JSON.
-     MIXED CAPTURE — the event survives the facts: when one capture states a dated occurrence AND
-     facts/relations around it ("It's Nadia's birthday on July 23; Nadia is Karim's daughter, so my
-     niece, and Tom's sister"), extract ALL of it: atomic_note kind="event" ("Nadia's birthday on
-     July 23", event_recurring=true) AND the has_birthday fact on Nadia AND the daughter_of/sibling_of
-     relations. The surrounding context is NEVER a reason to route the capture as facts-only and drop
-     the event note.
- (f) LIVED EPISODE (kind="episode"): something that HAPPENED, recounted for having happened — an
-     outing, a meal, a meeting, a trip, a call that took place ("yesterday I had lunch with Manon",
-     "I went climbing with Théo", "I called the plumber"). EMIT THE NOTE. What was lived is what a
-     memory is made of, and an episode nobody wrote down is simply lost.
-     THE PAST TENSE IS NOT THE TEST — read the ACTION, not the tense:
-      · ANOTHER NAMED PERSON IS IN IT → kind="episode", always, no matter how ordinary the
-        activity. A meal, a coffee, a walk, a phone call: "I had dinner at Léa's yesterday"
-        (FR: "j'ai mangé chez Léa hier") IS an episode — shared time with someone is exactly
-        what a personal memory exists to hold. Do not weigh whether it was interesting.
-      · no other person, but a PLACE worth naming, an OUTCOME, or a FIRST TIME → kind="episode".
-      · a solitary routine chore or errand — nobody, nowhere, nothing achieved ("I bought bread",
-        "I did the dishes", "I took the bins out") → NO note. It was lived, but nothing in it
-        will ever be worth resurfacing. It is still NOT is_ephemeral: it is DONE, not pending —
-        marking it so would resurrect it as a reminder to do what is already done.
-      · it happened AND establishes something durable ("I called the plumber, he's coming Tuesday")
-        → emit the episode AND the fact/event it establishes. The two coexist; neither replaces
-        the other.
-      · it is stated only to report a current state ("I've already eaten", "I'm done with the
-        dishes") → no note. Nothing was lived worth keeping, only a status.
-     THE ACTION MUST BE ALREADY LIVED. First person alone is not enough: an intention, an
-     obligation or a plan ("I have to prepare the demo", "I need to call X", "I'm going to learn
-     Japanese"; FR: "je dois préparer…", "je veux apprendre…") has NOT happened yet — it is not an
-     episode. Route it on its own merits: task (d) or project.
-     AN EPISODE NEEDS A WHEN. A habit or a biographical trait carries no situated moment ("I played
-     piano as a child", "I used to run every morning"; FR: "je faisais du piano quand j'étais
-     petit") → NOT an episode: that is durable knowledge about the author, so emit the FACT. Never
-     let an episode note take a biographical fact's place.
-     An episode is NEVER is_ephemeral: it does not expire in 48h, it fades on its own.
-     Progress on a project stays a project_entry (PROJECT vs TASK rule below), not an episode.
-     A PENDING ACTION OUTRANKS THE EPISODE. One capture yields exactly ONE atomic_note: when it
-     recounts something lived AND names something still to do ("I called the dentist this morning,
-     I need to call back Thursday"; FR: "j'ai appelé le dentiste ce matin, il faut que je rappelle
-     jeudi"), the note is the TASK (d), with its date. What is still owed must never be buried
-     inside a memory — the lived half survives in the facts and entities the capture also yields.
+GATE — check this FIRST, before the table.
+THE GATE NEVER APPLIES TO A CAPTURE CARRYING A DATE. A date makes it an occurrence, which always
+goes to the table, row 2 — whichever way round it is phrased ("12 June is Yanis's birthday",
+"Léa's birthday is 16 June", "the meeting is on Tuesday"), and no matter how many similar captures
+already appear in the context: a date seen before is still a date to remember.
+Otherwise atomic_note = null, whatever else you extract, when the capture is:
+ · a statement whose whole content is an attribute of someone or something, "X has / is / does Y"
+   ("Marie has a cat Gipsy", "my mother has a new cat") → facts and relations only
+ · a bare link or reference, with no stance taken on it → no note
+ · progress on a project ("I made progress on X today, tested Y") → project_entries
+ · a bare status ("I've already eaten", "that's sent") → nothing was lived, no note
+ · a solitary routine chore already done, nobody nowhere nothing achieved ("I bought bread", "I did
+   the dishes") → no note, and NOT is_ephemeral: it is done, not pending
+ · a habit or a biographical trait with no situated moment ("I played piano as a child", "I used to
+   run every morning") → durable knowledge about the author: emit the FACT, no note
+SVO fail-safe: if the capture rephrases fully as (subject, predicate, object) triples, it is a fact,
+not a note. A note always carries a move that no triple holds.
 
-is_ephemeral policy — do NOT drop durable thoughts:
-DEFAULT is_ephemeral=false. Set it true ONLY for a trivial expiring errand: something still TO DO,
-with NO durable content, NO named addressee, NO commitment and NO date ("buy bread"; FR: "acheter du
-pain"). All four must be absent at once. Any one of them present ⇒ is_ephemeral=false.
-is_ephemeral=true REQUIRES A VERB OF ACTION IN THE INFINITIVE OR IMPERATIVE, aimed at the author,
-naming something they must go and DO ("buy bread", "call back", "pick up the parcel"). No such verb
-in the capture ⇒ is_ephemeral=false, mechanically, without weighing anything else. A URL, a
-statement, a reported sentence, an anniversary, a past action: none of them carries one, so none of
-them is ever ephemeral — a link is not a chore, and putting it on a 48h timer files a reminder to
-run an errand that does not exist. This decides is_ephemeral ONLY; it never suppresses an
-atomic_note, and an already-lived action still gets its episode note (f).
-is_ephemeral=true marks a GENUINELY expiring short-term errand/reminder (~48h TTL), NOT a durable
-thought. A reflective note (criteria a/b/c) is DURABLE → set is_ephemeral=false. is_ephemeral=true
-may coexist with an atomic_note ONLY for a task/event (d/e) — the reminder now + the durable note.
-A kind="note" reflection must NEVER be marked is_ephemeral=true (it would be silently lost).
-AN ERRAND ALREADY DONE IS NEVER is_ephemeral. "I bought bread this morning" (FR: "j'ai acheté du pain
-ce matin") is something LIVED, not something to do — it is an EPISODE (f). is_ephemeral=true only
-ever describes an action still PENDING; putting a done errand there resurrects it as a reminder.
+ROUTING TABLE — past the gate, read top to bottom, take the FIRST row that matches, stop there. The
+order IS the rule: it settles every conflict, so never weigh two rows against each other.
 
-Otherwise atomic_note = null. In particular, atomic_note = null for ALL these cases:
- - "X has/is/does Y" → fact about X ("Karim has a project called Atlas", "Marie has a cat Gipsy",
-   "Léa probably adopted a dog", "my mother has a new cat").
- - A past action reported ONLY as a status, with nothing lived in it ("I've already eaten", "that's
-   sent") → entities/facts if any, no note. Anything actually LIVED is an EPISODE (f), which does
-   get its note.
- - Project progress report ("I made progress on X today, tested Y") → project_entries, not atomic_note
-   (unless an explicit reflection is added).
- - Trivial micro-errand, WITHOUT an addressee or stakes, WITHOUT durable content or a date ("I need to
-   buy bread", "buy a harness") → ephemeral intention only, no note. BUT as soon as there is a named
-   addressee, a commitment or a date, it is NO LONGER ephemeral → task (d) (with event_date if there's
-   a deadline) or event (e).
+ 0. PROJECT — a MULTI-step or long-running undertaking, or anything the capture itself calls a
+    project ("learn Japanese", "climb a 7a", "renovate the flat", "new project: X"), is a PROJECT
+    and NEVER a mere task. Emit its project_entry (rule below); its note is row 4 — the founding
+    statement, not an action to perform.
 
-SVO fail-safe: if the capture can be fully rephrased as (subject, predicate, object) or a list of such
-triples, it's a fact, not a note. A note always carries a reflective move that doesn't fit in a triple.
+ 1. TASK — kind="task". Something still TO DO, by whoever must do it. Every action still to do
+    yields atomic_note != null AND kind="task", EXCEPT the one narrow case closing this row.
+    · an action verb in the infinitive or imperative ("call the dentist", "buy a harness"), or
+      "I need to / I have to / I should / remember to…"
+    · an action ADDRESSED to a named person or organization ("reply to Vincent's email", "present
+      the business plan to Ziyu"), or an ADMINISTRATIVE step ("declare my income to the tax office")
+    · two words, the imperative or the 2nd person still count
+    · with a due date → kind stays "task", fill event_date. A dated task is NOT an event.
+    · reported speech gives the action to SOMEONE ELSE ("Marie told me she had to call the
+      dentist") → mention Marie so it lands on her fiche, never as the author's own
+    Never extract facts about the named entities while dropping the action.
+    Falls through, and only here:
+    · an action CANCELLED ("I'm finally not calling the dentist") → row 4
+    · a trivial micro-errand — and ONLY a personal purchase or household chore whose object is an
+      ordinary consumable or piece of gear, STILL TO DO — in the infinitive or the imperative
+      ("buy bread", "buy a harness", "take the bins out") — with no name, no date and nothing owed
+      to anyone → atomic_note = null AND is_ephemeral = true, together.
+      In the PAST it is done, not pending ("I bought bread this morning") → atomic_note = null and
+      is_ephemeral = FALSE; marking it true would resurrect it as a reminder to do what is done.
+      Anything SENT, PAID, FILED, DECLARED, or ADDRESSED to a person or an organization is a
+      COMMITMENT and stays a task, however short the phrasing and whatever the name looks like —
+      lowercase, unfamiliar, an acronym you do not recognise ("send the quote to the accountant",
+      "pay the rent", "file the claim").
 
-PROJECT vs TASK rule (high priority — decide BEFORE emitting kind="task"):
-A PROJECT is a MULTI-step undertaking or one that spans TIME, driven by a goal (learn X, reach a level,
-build/renovate Y, organize a trip). A TASK is a single bounded action ("call the dentist", "buy bread").
-- If the capture explicitly calls something a "project" ("I have a project to…", "my project X", "new
-  project: X"; FR: "j'ai un projet de…", "nouveau projet : X") → it's a PROJECT, NEVER a mere task.
-  Emit a project_entry (is_new=true if absent from EXISTING PROJECTS) AND an entity type="project".
-- If the goal implies MULTIPLE steps or a LONG duration ("climb a 7a", "learn Japanese", "renovate the
-  flat", "run a marathon") → treat it as a PROJECT even without the word "project": create the project
-  (is_new) and put the goal in `content`.
-- Name the project by its durable DOMAIN rather than the one-off action ("I have a climbing project to
-  do a 7a" → project_canonical="Climbing", content="Goal: climb a 7a") — so future progress ("did a
-  6a") attaches to the same project.
-- The project is an UMBRELLA: later sub-tasks and progress in the domain attach to it via
-  project_entries rather than living as isolated tasks.
-- A genuine isolated action, with no obvious parent project, stays kind="task" (cf. rule (d)).
-- A capture that FOUNDS a project also deserves its note: emit the project_entry AND an atomic_note
-  carrying what was said, so the project opens with a first entry instead of an empty shell. The note
-  is the founding statement, not a task to perform.
+ 2. EVENT — kind="event". A dated occurrence the author ATTENDS, or that recurs.
+    · "Vivatech on the 24th", "I have Pierre's party on the 20th", "dentist appointment Tuesday"
+    · a bare noun phrase with NO verb still yields the note: a date + an occurrence ⇒ an event
+    · task vs event: a task you DO (active), an event you ATTEND (passive). A verb proves nothing —
+      ask who acts on what.
+    · event_date = ABSOLUTE (resolve "Tuesday" via {today})
+    · BIRTHDAYS — three wordings, three answers, nothing to weigh:
+        a CELEBRATION is named (party, drinks, dinner) → event note, event_recurring=true,
+          classification_confidence 1.0
+        a BARE anniversary date ("12 June is Yanis's birthday") → STILL the event note,
+          event_recurring=true, AND the has_birthday fact, classification_confidence < 0.6. NEVER
+          drop the note in favour of the fact alone: a fact reaches no validation queue, and the
+          question would be silently answered instead of arbitrated.
+        a BIRTH is stated ("born on 3 March", "born in 1990") → has_birthday fact only, no note
+    · the note survives its surroundings: facts and relations in the same capture NEVER absorb it
+      ("It's Nadia's birthday on July 23; Nadia is Karim's daughter and Tom's sister" → the event
+      note AND the has_birthday fact AND both relations), and is_ephemeral=true never removes it
+    Falls through: already past → row 3.
+
+ 3. EPISODE — kind="episode". Something ALREADY LIVED, told for having happened.
+    · another NAMED PERSON is in it → episode, always, however ordinary ("I had dinner at Léa's
+      yesterday", "I went climbing with Théo"). Do not weigh whether it was interesting.
+    · nobody else, but a PLACE worth naming, an OUTCOME or a FIRST TIME → episode
+    · it also establishes something durable ("I called the plumber, he's coming Tuesday") → emit
+      the episode AND the fact/event it establishes; neither replaces the other
+    · never is_ephemeral: it is DONE, not pending
+    Falls through: not lived yet — an intention, a plan, an obligation ("I have to prepare the
+    demo", "I'm going to learn Japanese") → row 0 or 1. Everything else the gate already excluded.
+
+ 4. NOTE — kind="note". A thought of the author worth resurfacing. DURABLE, never is_ephemeral.
+    · reflective first person ("I think that…", "I realized that…", "I wonder whether…", "I want
+      to stop…")
+    · a quote, or an external work / author / idea the author takes a stance on ("Schopenhauer
+      says X, but I find Y")
+    · a contemplative observation that reduces to no fact ("funny how…", "I noticed that…")
+    · a decision, INCLUDING a decision against something — a cancelled action lands here
+    · the founding statement of a project, so it opens with a first entry instead of an empty shell
+
+ 5. NOTHING — atomic_note = null. No row matched, and the gate already named the usual cases.
+
+THE NOTE SURVIVES THE FACTS — the single most frequent failure, and the reason the table exists.
+When a capture states an occurrence, an action or a lived moment AND ALSO carries facts or
+relations, extracting the facts NEVER discharges you of the note. Both go in the SAME JSON:
+ · "It's Nadia's birthday on July 23; Nadia is Karim's daughter and Tom's sister" → the event note
+   AND the has_birthday fact AND both relations.
+ · "Meeting with Léna on 12 September about the Acme contract, she's just been promoted" → the
+   event note AND her promotion fact AND the project entry.
+ · "Marie told me she had to call the dentist" → the task note, mentioning Marie, AND her entity.
+ · "I went climbing with Alexis today and got my 6b+" → the episode note AND the project entry.
+Never settle for the structured half. A capture rich in entities is the case where the note matters
+MOST, not least.
+
+is_ephemeral — an independent flag, decided AFTER the table and never a substitute for it:
+DEFAULT false. Set it true ONLY when ALL FOUR hold at once:
+ · an ACTION VERB in the infinitive or imperative, aimed at the author, naming something to go and
+   DO ("buy bread", "call back", "pick up the parcel")
+ · still PENDING — an action already done is never ephemeral
+ · no named addressee, no commitment, no date
+ · no durable content
+Any one missing ⇒ is_ephemeral=false, mechanically, without weighing anything else. A URL, a
+statement, a reported sentence, an anniversary, a past action: none carries such a verb, so none of
+them is ever ephemeral.
+is_ephemeral=true never suppresses an atomic_note. It may coexist with one only for rows 1 and 2
+(the 48h reminder AND the durable note). A kind="note" is NEVER is_ephemeral=true — it would be
+silently lost.
+
+PROJECT vs TASK (row 0):
+A PROJECT is a MULTI-step undertaking or one that spans TIME, driven by a goal (learn X, reach a
+level, build/renovate Y, organize a trip). A TASK is a single bounded action ("call the dentist").
+- Called a project in the capture ("my project X", "new project: X"; FR: "j'ai un projet de…") →
+  a project_entry (is_new=true if absent from EXISTING PROJECTS) AND an entity type="project".
+- A goal implying MULTIPLE steps or a LONG duration ("climb a 7a", "learn Japanese", "renovate the
+  flat", "run a marathon") → a PROJECT even without the word: create it (is_new) and put the goal
+  in `content`.
+- Name it by its durable DOMAIN, not the one-off action ("a climbing project to do a 7a" →
+  project_canonical="Climbing", content="Goal: climb a 7a") — so later progress ("did a 6a")
+  attaches to the same project.
+- The project is an UMBRELLA: later sub-tasks and progress in the domain attach via project_entries
+  rather than living as isolated tasks.
+- A genuine isolated action, with no obvious parent project, stays kind="task".
 
 project_entries rules:
 - If the capture is explicitly tied to ONE OR MORE projects (declared or named), produce ONE entry per
