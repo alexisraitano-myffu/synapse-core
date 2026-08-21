@@ -76,6 +76,13 @@ jobs:
       - name: Assemble SynapseCore.xcframework
         run: |
           set -euo pipefail
+          # `xcodebuild -create-xcframework` n'écrase pas : si la sortie existe
+          # déjà, il s'arrête sur « xc-headers couldn't be copied to ios-arm64 »
+          # (exit 70). Le dossier survit d'un run à l'autre parce que le cache
+          # Rust restaure `target/` — d'où un échec à CHAQUE push, et zéro
+          # artefact iOS produit depuis des semaines. Repartir d'une sortie
+          # propre, quelle que soit la raison de sa présence.
+          rm -rf target/SynapseCore.xcframework target/xc-headers
           mkdir -p target/xc-headers
           cp target/swift/*FFI.h target/xc-headers/
           cp target/swift/*FFI.modulemap target/xc-headers/module.modulemap
