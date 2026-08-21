@@ -77,8 +77,9 @@ Otherwise atomic_note = null, whatever else you extract, when the capture is:
  · a bare link or reference, with no stance taken on it → no note
  · progress on a project ("I made progress on X today, tested Y") → project_entries
  · a bare status ("I've already eaten", "that's sent") → nothing was lived, no note
- · a solitary routine chore already done, nobody nowhere nothing achieved ("I bought bread", "I did
-   the dishes") → no note, and NOT is_ephemeral: it is done, not pending
+ · a SOLITARY ROUTINE ACTIVITY already done — nobody else, no named place, nothing achieved.
+   A chore ("I bought bread", "I did the dishes") or an ordinary session ("went for a run this
+   morning, felt good") → no note, and NOT is_ephemeral: it is done, not pending
  · a habit or a biographical trait with no situated moment ("I played piano as a child", "I used to
    run every morning") → durable knowledge about the author: emit the FACT, no note
 SVO fail-safe: if the capture rephrases fully as (subject, predicate, object) triples, it is a fact,
@@ -94,7 +95,7 @@ order IS the rule: it settles every conflict, so never weigh two rows against ea
 
  1. TASK — kind="task". Something still TO DO, by whoever must do it. Every action still to do
     yields atomic_note != null AND kind="task", EXCEPT the one narrow case closing this row.
-    · an action verb in the infinitive or imperative ("call the dentist", "buy a harness"), or
+    · an action verb in the infinitive or imperative ("call the dentist", "book the appointment"), or
       "I need to / I have to / I should / remember to…"
     · an action ADDRESSED to a named person or organization ("reply to Vincent's email", "present
       the business plan to Ziyu"), or an ADMINISTRATIVE step ("declare my income to the tax office")
@@ -105,10 +106,12 @@ order IS the rule: it settles every conflict, so never weigh two rows against ea
     Never extract facts about the named entities while dropping the action.
     Falls through, and only here:
     · an action CANCELLED ("I'm finally not calling the dentist") → row 4
-    · a trivial micro-errand — and ONLY a personal purchase or household chore whose object is an
-      ordinary consumable or piece of gear, STILL TO DO — in the infinitive or the imperative
-      ("buy bread", "buy a harness", "take the bins out") — with no name, no date and nothing owed
-      to anyone → atomic_note = null AND is_ephemeral = true, together.
+    · a trivial micro-errand — and ONLY the purchase of an ordinary CONSUMABLE or a household
+      chore, STILL TO DO, in the infinitive or the imperative ("buy bread", "buy milk", "take the
+      bins out"), with no name, no date and nothing owed to anyone
+      → atomic_note = null AND is_ephemeral = true, together.
+      DURABLE EQUIPMENT IS NOT A CONSUMABLE. "buy a harness", "buy a desk", "buy running shoes"
+      involve a choice and a price: they are TASKS with a note, not errands that expire.
       In the PAST it is done, not pending ("I bought bread this morning") → atomic_note = null and
       is_ephemeral = FALSE; marking it true would resurrect it as a reminder to do what is done.
       Anything SENT, PAID, FILED, DECLARED, or ADDRESSED to a person or an organization is a
@@ -138,7 +141,9 @@ order IS the rule: it settles every conflict, so never weigh two rows against ea
  3. EPISODE — kind="episode". Something ALREADY LIVED, told for having happened.
     · another NAMED PERSON is in it → episode, always, however ordinary ("I had dinner at Léa's
       yesterday", "I went climbing with Théo"). Do not weigh whether it was interesting.
-    · nobody else, but a PLACE worth naming, an OUTCOME or a FIRST TIME → episode
+    · nobody else, but a PLACE worth naming, or an ACHIEVEMENT — a first time, a record, a
+      measurable result ("my first half-marathon", "got my 6b+") → episode. A FEELING IS NOT AN
+      ACHIEVEMENT: "went for a run this morning, felt good" stays routine → no note.
     · it also establishes something durable ("I called the plumber, he's coming Tuesday") → emit
       the episode AND the fact/event it establishes; neither replaces the other
     · never is_ephemeral: it is DONE, not pending
