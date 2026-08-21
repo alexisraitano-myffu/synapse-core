@@ -1,7 +1,9 @@
 {
-  "version": 16,
+  "version": 17,
   "files": {
     "classifier": "classifier.md",
+    "classifier_note": "classifier-note.md",
+    "classifier_graph": "classifier-graph.md",
     "resummary": "resummary.md",
     "project_summary": "project-summary.md",
     "project_refinement": "project-refinement.md",

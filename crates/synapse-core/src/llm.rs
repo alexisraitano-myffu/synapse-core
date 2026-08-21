@@ -1,10 +1,17 @@
 //! Classifier orchestration (SYN-111 / T2): prompt build + Anthropic HTTP +
 //! tolerant parse — the LLM I/O half of the Dream Cycle brain.
 //!
-//! The prompt is DATA (SYN-96 invariant): `prompts/classifier.md`, versioned
-//! in this repo, read at runtime from `prompts_dir`, `{today}` substituted.
-//! Editing it never requires a recompilation, and the apps bundle the same
-//! files as assets.
+//! The prompt is DATA (SYN-96 invariant): versioned in this repo, read at
+//! runtime from `prompts_dir`, `{today}` substituted. Editing it never requires
+//! a recompilation, and the apps bundle the same files as assets.
+//!
+//! Since SYN-171 there are TWO prompts, not one: `classifier-note.md` (routing
+//! + prose) and `classifier-graph.md` (entities, facts, relations, projects).
+//! `classifier.md` is the superseded single-call prompt — kept as the documented
+//! fallback and as the size reference the tests compare against, no longer read
+//! by this module. One measured consequence to keep in mind before growing or
+//! shrinking a half: Haiku caches a system prefix only above 4096 tokens, and
+//! both halves sit below it while the single call sat above.
 //!
 //! Two entry points, mirroring the Python split:
 //! - [`Brain::build_classify_params`] returns the full `messages.create`
@@ -117,6 +124,38 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const FALLBACK_TYPES: &[&str] =
     &["person", "place", "project", "concept", "organization", "animal"];
 
+/// SYN-171 — which half of the classifier a call is running.
+///
+/// The capture used to go through ONE prompt holding every rule at once. Measured
+/// 2026-08-21 on 59 cases: compacting that prompt cost Gemma E2B a THIRD of its
+/// notes (34 → 22) while leaving Haiku untouched, and a complete 2×2 (prompt ×
+/// constrained schema) cleared the schema — it was the prompt alone. The rules
+/// the compaction dropped were repetitions of one invariant ("extracting facts
+/// never absorbs the note"), useless to a large model and load-bearing for a
+/// small one.
+///
+/// Splitting removes the need to repeat it: the graph call has no `atomic_note`
+/// field at all, so the invariant stops being a sentence to hammer and becomes
+/// STRUCTURAL. The two calls are deliberately INDEPENDENT — the extractor never
+/// sees the routing — because chaining them would restore the coupling we are
+/// removing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClassifyHalf {
+    /// What the capture leaves behind: note, kind, owner, dates, ephemerality.
+    Note,
+    /// What it says about the world: entities, facts, relations, project entries.
+    Graph,
+}
+
+impl ClassifyHalf {
+    fn prompt_file(self) -> &'static str {
+        match self {
+            ClassifyHalf::Note => "classifier-note.md",
+            ClassifyHalf::Graph => "classifier-graph.md",
+        }
+    }
+}
+
 impl Brain {
     /// Port of `_classify_params`: stable rules (cached) + optional working
     /// memory (cached) + live vocab / projects / owner blocks (uncached).
@@ -125,8 +164,9 @@ impl Brain {
         content: &str,
         day_context: Option<&str>,
         config: &LlmConfig,
+        half: ClassifyHalf,
     ) -> Result<Value, CoreError> {
-        let prompt_path = std::path::Path::new(&config.prompts_dir).join("classifier.md");
+        let prompt_path = std::path::Path::new(&config.prompts_dir).join(half.prompt_file());
         let template = std::fs::read_to_string(&prompt_path).map_err(|e| {
             CoreError::Storage(format!("cannot read {}: {e}", prompt_path.display()))
         })?;
@@ -146,8 +186,18 @@ impl Brain {
         }
 
         let conn = self.storage.lock()?;
-        system_blocks.push(json!({"type": "text", "text": active_types_block(&conn)?}));
-        system_blocks.push(json!({"type": "text", "text": active_projects_block(&conn)?}));
+        // The live vocabulary and the project list only steer fields the GRAPH
+        // half emits (`entities[].type`, `project_entries[].project_canonical`).
+        // Sending them to the note half would spend input on blocks whose target
+        // fields do not exist in its schema — and the whole point of the split is
+        // that a half only ever reads what it can write.
+        if half == ClassifyHalf::Graph {
+            system_blocks.push(json!({"type": "text", "text": active_types_block(&conn)?}));
+            system_blocks.push(json!({"type": "text", "text": active_projects_block(&conn)?}));
+        }
+        // Who the author is matters to BOTH: the note half needs it to tell a
+        // reported action from the author's own (SYN-182 `atomic_note_owner`),
+        // the graph half to resolve "me"/"my" onto the right entity.
         if let Some(owner) = owner_block(&conn)? {
             system_blocks.push(json!({"type": "text", "text": owner}));
         }
@@ -161,14 +211,17 @@ impl Brain {
         }))
     }
 
-    /// Port of `step1_classify`: build params, POST /v1/messages, parse.
-    pub fn classify(
+    /// One half: build params, POST /v1/messages, parse. Billing is recorded per
+    /// call — the split doubles the number of calls, and a books entry that
+    /// counted them as one would understate what the cycle actually costs.
+    fn classify_half(
         &self,
         content: &str,
         day_context: Option<&str>,
         config: &LlmConfig,
+        half: ClassifyHalf,
     ) -> Result<Value, CoreError> {
-        let params = self.build_classify_params(content, day_context, config)?;
+        let params = self.build_classify_params(content, day_context, config, half)?;
         let body = post_messages(config, &params)?;
         // SYN-160 — recorded before parsing: the call is billed whether or not
         // its JSON turns out to be usable, so a parse failure must not make the
@@ -181,6 +234,53 @@ impl Brain {
         let stop_reason = body["stop_reason"].as_str();
         parse_classify_text(text, content.chars().count(), stop_reason)
     }
+
+    /// Port of `step1_classify`, in TWO independent calls since SYN-171.
+    ///
+    /// The note half runs first so a failure costs one call instead of two, but
+    /// nothing is threaded from it into the graph half: independence IS the
+    /// mechanism. `route_capture` consumes a single merged object, so the split
+    /// stops at this boundary and no caller downstream has to know about it.
+    pub fn classify(
+        &self,
+        content: &str,
+        day_context: Option<&str>,
+        config: &LlmConfig,
+    ) -> Result<Value, CoreError> {
+        let note = self.classify_half(content, day_context, config, ClassifyHalf::Note)?;
+        let graph = self.classify_half(content, day_context, config, ClassifyHalf::Graph)?;
+        Ok(merge_halves(note, graph))
+    }
+}
+
+/// Fuse the two halves back into the shape `route_capture` has always consumed.
+///
+/// Each half owns its fields outright — no key is written by both, so there is
+/// nothing to arbitrate and the merge cannot silently prefer one call's opinion
+/// over the other's. `language` is the one exception: both halves detect it, and
+/// the note half wins because it is the half that WRITES prose in that language.
+///
+/// The three collections are forced to arrays even when the graph half omits
+/// them: `route_capture` reads them with `arr()`, and a missing key would read
+/// as "nothing to extract" — indistinguishable from a half that failed to answer.
+pub fn merge_halves(note: Value, graph: Value) -> Value {
+    let mut merged = serde_json::Map::new();
+    if let Value::Object(g) = graph {
+        for (k, v) in g {
+            merged.insert(k, v);
+        }
+    }
+    if let Value::Object(n) = note {
+        for (k, v) in n {
+            merged.insert(k, v);
+        }
+    }
+    for key in ["entities", "relations", "project_entries"] {
+        if !merged.get(key).map(Value::is_array).unwrap_or(false) {
+            merged.insert(key.into(), json!([]));
+        }
+    }
+    Value::Object(merged)
 }
 
 /// The single LLM chokepoint shared by classify and the T5 summary calls
