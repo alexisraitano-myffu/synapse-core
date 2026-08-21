@@ -249,13 +249,22 @@ fn merge_proposals(conn: &Connection) -> Result<Vec<Value>, CoreError> {
 }
 
 /// The `GET /atomic-notes?review_status=pending` payload (SYN-143): the
-/// « À valider » task/event queue (low-confidence classifications).
+/// « À valider » queue.
+///
+/// SYN-182 — it used to hold only task/event, and only one implicit question:
+/// « I might lose this, keep it? ». It now also holds notes and episodes, whose
+/// question is a different one — « I am not sure this deserves to exist » — and
+/// recurrences, whose question is « does this date really come back every year? ».
+/// Three questions in one queue would be unanswerable, so `review_reason` travels
+/// with each row and the UI asks the right one. `owner` travels too: a task the
+/// user is validating on someone else's behalf is not the same object.
 fn pending_tasks(conn: &Connection) -> Result<Vec<Value>, CoreError> {
     let rows = query_rows(
         conn,
         "SELECT id, title, content, summary, entities_mentioned, memory_strength, \
                 provenance_capture_id, created_at, updated_at, \
-                kind, event_date, event_recurring, archived_at, review_status \
+                kind, event_date, event_recurring, archived_at, review_status, \
+                review_reason, owner \
          FROM atomic_notes WHERE archived_at IS NULL AND review_status = 'pending' \
          ORDER BY created_at DESC LIMIT 50",
         &[],

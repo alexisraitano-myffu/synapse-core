@@ -331,6 +331,19 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         // SYN-119 — capture language (ISO 639-1), nullable. Detected server-side by
         // the classifier; drives content-language entity summaries + weekly digest.
         "ALTER TABLE atomic_notes ADD COLUMN language TEXT",
+        // SYN-182 — who owes the action. NULL = the author, which is every row
+        // written before this column existed. A named owner comes from reported
+        // speech ("Marie told me she had to call the dentist") and is what keeps
+        // the task off the author's own lists while staying on Marie's fiche.
+        // Deliberately a name, not a user id: this is not multi-account, it is
+        // one field so the prompt's promise stops being unrepresentable.
+        "ALTER TABLE atomic_notes ADD COLUMN owner TEXT",
+        // SYN-182 — why the row is « À valider ». The queue used to carry one
+        // meaning ("I might lose this"); extending it to notes and episodes adds
+        // a second ("I am not sure this deserves to exist"). Two meanings in one
+        // queue is the real cost, so the reason is named and the UI can ask the
+        // right question. NULL whenever review_status = 'confirmed'.
+        "ALTER TABLE atomic_notes ADD COLUMN review_reason TEXT",
     ];
 
     for ddl in alters {

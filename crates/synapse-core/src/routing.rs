@@ -315,13 +315,46 @@ impl Brain {
                     "SYNAPSE_REVIEW_CONFIDENCE_THRESHOLD",
                     REVIEW_CONFIDENCE_THRESHOLD_DEFAULT,
                 );
-                let review_status = if (note_kind == "task" || note_kind == "event")
-                    && conf < threshold
-                {
-                    "pending"
-                } else {
-                    "confirmed"
-                };
+                // SYN-182 — « À valider » covers every kind now, with a named
+                // reason. The queue was built on 2026-06-29 so a doubtful TASK
+                // would never be thrown away; the `episode` kind was born in
+                // 2026-08 and was never added to the gate, so a model hesitating
+                // at 0.2 still wrote `confirmed`. A doubtful note only clutters —
+                // but an episode ASSERTS that something took place and feeds the
+                // timeline, which is why it goes first.
+                //
+                // Recurrence is a distinct doubt from existence, and the costlier
+                // one: it commits us to notifying the user every year, forever.
+                // The prompt only ever justifies recurrence for a birthday, which
+                // is an `event` — so recurrence on any other kind was decided
+                // without a rule, and recurrence on a hesitant event IS the bare
+                // anniversary case. Both go to validation; only a confident event
+                // keeps its recurrence unaided, which is the named celebration the
+                // prompt actually covers. Same shape as « no model-driven
+                // deletion »: here, no model-driven yearly repeat.
+                let recurring = truthy(classified.get("event_recurring"));
+                let hesitant = conf < threshold;
+                let (review_status, review_reason) =
+                    if recurring && (note_kind != "event" || hesitant) {
+                        ("pending", Some("recurrence_inferee"))
+                    } else if hesitant {
+                        match note_kind.as_str() {
+                            "task" | "event" => ("pending", Some("perte_possible")),
+                            _ => ("pending", Some("existence_douteuse")),
+                        }
+                    } else {
+                        ("confirmed", None)
+                    };
+                // SYN-182 — reported speech gives the action to someone else. The
+                // prompt has promised "never as the author's own" since SYN-85 with
+                // nothing behind it: the column did not exist, so the note landed in
+                // the author's backlog anyway. NULL means the author, which is also
+                // every row written before today.
+                let owner = classified
+                    .get("atomic_note_owner")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
                 let summary = classified
                     .get("summary")
                     .and_then(Value::as_str)
@@ -347,8 +380,10 @@ impl Brain {
                         .filter(|s| !s.is_empty())
                         .map(|s| resolve_date(s, &ctx.today))
                         .as_deref(),
-                    truthy(classified.get("event_recurring")),
+                    recurring,
                     review_status,
+                    review_reason,
+                    owner,
                     language,
                 )?;
                 created_note_id = Some(note_id.clone());
@@ -1524,6 +1559,8 @@ fn persist_atomic_note(
     event_date: Option<&str>,
     event_recurring: bool,
     review_status: &str,
+    review_reason: Option<&str>,
+    owner: Option<&str>,
     language: Option<&str>,
 ) -> Result<String, CoreError> {
     let kind = if ["note", "task", "event", "episode"].contains(&kind) { kind } else { "note" };
@@ -1532,17 +1569,27 @@ fn persist_atomic_note(
     } else {
         "confirmed"
     };
+    // A reason without a pending status would be read by the UI as a question
+    // to ask about a row nobody is questioning.
+    let review_reason = if review_status == "pending" { review_reason } else { None };
     let title: String = if summary.is_empty() { content } else { summary }
         .chars()
         .take(60)
         .collect();
-    let durable = kind == "event" || kind == "task";
+    // SYN-182 — an episode HAS a date by nature; it just never got to keep one.
+    // `durable` used to mean "event or task", so "our first meeting with Marie
+    // was 18 April" was routed to `episode` (it is past) and then written with
+    // event_date = NULL and event_recurring = 0. The recurring meeting-anniversary
+    // was destroyed at insert time, not lost further down — no wording of the
+    // recurrence rule could have saved it.
+    let dated = matches!(kind, "event" | "task" | "episode");
     let note_id = new_uuid();
     conn.execute(
         "INSERT INTO atomic_notes \
          (id, title, content, summary, entities_mentioned, memory_strength, \
-          provenance_capture_id, kind, event_date, event_recurring, review_status, language) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+          provenance_capture_id, kind, event_date, event_recurring, review_status, \
+          review_reason, owner, language) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
             note_id,
             title,
@@ -1552,9 +1599,11 @@ fn persist_atomic_note(
             1.0,
             capture_id,
             kind,
-            if durable { event_date } else { None },
-            (durable && event_recurring) as i64,
+            if dated { event_date } else { None },
+            (dated && event_recurring) as i64,
             review_status,
+            review_reason,
+            owner,
             language,
         ],
     )?;
@@ -1987,5 +2036,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lang.as_deref(), Some("fr"));
+    }
+
+    /// SYN-182 — helper for the three gaps below. Routes one capture and hands
+    /// back the columns the ticket is about, so each test states its own case
+    /// instead of repeating the same twelve lines of scaffolding.
+    #[allow(clippy::type_complexity)]
+    fn route_one(classified: Value) -> (Option<String>, Option<String>, String,
+                                        Option<String>, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let brain = Brain::open(db.to_str().unwrap(), None).unwrap();
+        {
+            let conn = brain.storage.lock().unwrap();
+            conn.execute("INSERT INTO inbox (id, content) VALUES ('c1', 'x')", [])
+                .unwrap();
+        }
+        let entry = json!({"id": "c1", "content": "x"});
+        let ctx = RouteContext {
+            now: "2026-08-21T12:00:00".into(),
+            today: "2026-08-21".into(),
+            intentions_cutoff: "2026-08-19T12:00:00".into(),
+            now_sql: "2026-08-21 12:00:00".into(),
+        };
+        brain.route_capture(&entry, &classified, &ctx).unwrap();
+        let conn = brain.storage.lock().unwrap();
+        conn.query_row(
+            "SELECT owner, review_reason, review_status, event_date, event_recurring \
+             FROM atomic_notes WHERE provenance_capture_id = 'c1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    fn base_note(kind: &str) -> Value {
+        json!({
+            "language": "fr",
+            "atomic_note": "…",
+            "atomic_note_kind": kind,
+            "is_ephemeral": false,
+            "summary": "",
+            "entities": [],
+            "relations": [],
+            "project_entries": [],
+            "classification_confidence": 1.0
+        })
+    }
+
+    // SYN-182 · A — "Marie told me she had to call the dentist". The prompt has
+    // promised "never as the author's own" since SYN-85 with nothing behind it:
+    // there was no column to hold the answer, so the task landed in the author's
+    // backlog anyway. A named owner must survive to the row; anything else and
+    // the digest filter has nothing to filter on.
+    #[test]
+    fn reported_speech_keeps_the_owner_off_the_author() {
+        let mut c = base_note("task");
+        c["atomic_note_owner"] = json!("Marie");
+        let (owner, _, status, _, _) = route_one(c);
+        assert_eq!(owner.as_deref(), Some("Marie"));
+        assert_eq!(status, "confirmed", "un propriétaire n'est pas un doute");
+
+        // Le cas normal reste NULL — c'est ce que lisent toutes les lignes
+        // écrites avant l'existence de la colonne, et « mes tâches » compte
+        // dessus.
+        let (owner, ..) = route_one(base_note("task"));
+        assert_eq!(owner, None);
+    }
+
+    // SYN-182 · B — the queue was built for task/event only, so an episode the
+    // model was 20% sure about was still written `confirmed`. A doubtful note
+    // clutters; a doubtful episode ASSERTS that something took place.
+    #[test]
+    fn a_doubtful_episode_now_reaches_the_validation_queue() {
+        for (kind, attendu) in [
+            ("episode", "existence_douteuse"),
+            ("note", "existence_douteuse"),
+            ("task", "perte_possible"),
+            ("event", "perte_possible"),
+        ] {
+            let mut c = base_note(kind);
+            c["classification_confidence"] = json!(0.2);
+            let (_, reason, status, ..) = route_one(c);
+            assert_eq!(status, "pending", "{kind} hésitant doit aller en file");
+            assert_eq!(reason.as_deref(), Some(attendu), "motif pour {kind}");
+        }
+    }
+
+    // SYN-182 · C — two distinct doubts, and the costlier one is the recurrence:
+    // it commits us to notifying the user every year, forever. The prompt only
+    // justifies recurrence for a birthday, which is an `event`, so recurrence on
+    // any other kind was decided without a rule.
+    #[test]
+    fn an_inferred_recurrence_is_validated_a_confident_birthday_is_not() {
+        let mut c = base_note("episode");
+        c["event_date"] = json!("2026-04-18");
+        c["event_recurring"] = json!(true);
+        let (_, reason, status, date, recurring) = route_one(c);
+        assert_eq!(status, "pending");
+        assert_eq!(reason.as_deref(), Some("recurrence_inferee"));
+        // …et surtout la date SURVIT. Avant SYN-182, `durable` excluait
+        // l'épisode : « notre rencontre avec Marie était le 18 avril » était
+        // écrit avec NULL et 0, donc l'anniversaire de rencontre était détruit
+        // à l'insertion, sans qu'aucune règle de récurrence puisse le sauver.
+        assert_eq!(date.as_deref(), Some("2026-04-18"));
+        assert_eq!(recurring, 1);
+
+        // L'anniversaire nommé et assumé reste hors file : c'est le seul cas que
+        // le prompt couvre vraiment.
+        let mut c = base_note("event");
+        c["event_date"] = json!("2026-06-16");
+        c["event_recurring"] = json!(true);
+        let (_, reason, status, ..) = route_one(c);
+        assert_eq!(status, "confirmed");
+        assert_eq!(reason, None, "pas de motif sans doute");
     }
 }

@@ -19,6 +19,7 @@ Return ONLY valid JSON (no markdown):
   "language": "ISO 639-1 code of the capture's language (e.g. \"fr\", \"en\")",
   "atomic_note": "string or null (free / non-factual thought kept as its own node that MENTIONS entities without becoming one). WRITE IT IN THE CAPTURE'S LANGUAGE.",
   "atomic_note_kind": "note|task|event|episode (qualifies a non-null atomic_note; default: note)",
+  "atomic_note_owner": "null (the author — the normal case) or the NAME of the person the action belongs to, when the capture reports someone else's action",
   "event_date": "YYYY-MM-DD or null (ABSOLUTE date — for an event: the occurrence date; for a task: its deadline if any)",
   "event_recurring": false,
   "project_entries": [
@@ -102,7 +103,8 @@ order IS the rule: it settles every conflict, so never weigh two rows against ea
     · two words, the imperative or the 2nd person still count
     · with a due date → kind stays "task", fill event_date. A dated task is NOT an event.
     · reported speech gives the action to SOMEONE ELSE ("Marie told me she had to call the
-      dentist") → mention Marie so it lands on her fiche, never as the author's own
+      dentist") → keep the task AND set atomic_note_owner to that person's name. The name is
+      what keeps it off the author's own list; leave it null and it becomes the author's.
     Never extract facts about the named entities while dropping the action.
     Falls through, and only here:
     · an action CANCELLED ("I'm finally not calling the dentist") → row 4
@@ -146,6 +148,9 @@ order IS the rule: it settles every conflict, so never weigh two rows against ea
       ACHIEVEMENT: "went for a run this morning, felt good" stays routine → no note.
     · it also establishes something durable ("I called the plumber, he's coming Tuesday") → emit
       the episode AND the fact/event it establishes; neither replaces the other
+    · an episode HAS a date: fill event_date when the capture states one, even in the past
+      ("our first meeting with Marie was 18 April"). A past date that COMES BACK — a meeting
+      anniversary, a wedding date — also takes event_recurring=true.
     · never is_ephemeral: it is DONE, not pending
     Falls through: not lived yet — an intention, a plan, an obligation ("I have to prepare the
     demo", "I'm going to learn Japanese") → row 0 or 1. Everything else the gate already excluded.

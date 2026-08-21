@@ -105,9 +105,16 @@ pub(crate) fn gather_week(
     // case stays correct.
     let dated_raw = query_row_maps(
         conn,
+        // SYN-182 — a RECURRING episode belongs here too. "our first meeting with
+        // Marie was 18 April" is past, so the routing table sends it to `episode`;
+        // it is still a date that comes back every year, and before today it could
+        // not even be stored. Non-recurring episodes stay out by construction —
+        // they are one-shots already behind us. `owner IS NULL` keeps someone
+        // else's dated task off my week.
         "SELECT title, content, kind, event_date, event_recurring FROM atomic_notes \
-         WHERE kind IN ('event', 'task') AND archived_at IS NULL AND event_date IS NOT NULL \
-         AND review_status != 'pending'",
+         WHERE (kind IN ('event', 'task') OR (kind = 'episode' AND event_recurring = 1)) \
+         AND archived_at IS NULL AND event_date IS NOT NULL \
+         AND review_status != 'pending' AND owner IS NULL",
         &[],
     )?;
     let mut upcoming: Vec<Value> = Vec::new();
@@ -195,11 +202,16 @@ pub(crate) fn gather_week(
     upcoming.sort_by(|a, b| a["date"].as_str().cmp(&b["date"].as_str()));
 
     // Open tasks WITHOUT a date (dated ones already surface under « à venir »).
+    // SYN-182 — `owner IS NULL` means the author, so this is « my open tasks ».
+    // A task extracted from reported speech ("Marie told me she had to call the
+    // dentist") carries her name and stays out of this list; it lives on her
+    // fiche instead. The prompt has promised exactly that since SYN-85, and this
+    // is the first place the promise is actually kept.
     let open_tasks = query_row_maps(
         conn,
         "SELECT title, content FROM atomic_notes \
          WHERE kind = 'task' AND archived_at IS NULL AND event_date IS NULL \
-         AND review_status != 'pending' \
+         AND review_status != 'pending' AND owner IS NULL \
          ORDER BY created_at DESC LIMIT ?1",
         &[SqlV::from(MAX_TASKS)],
     )?;
