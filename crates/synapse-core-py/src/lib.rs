@@ -510,8 +510,13 @@ impl Brain {
             .map_err(brain_err)
     }
 
-    /// `messages.create` params for one capture (Batch API path) → JSON.
-    #[pyo3(signature = (content, day_context, model, prompts_dir, today))]
+    /// `messages.create` params for ONE HALF of one capture (Batch API path) → JSON.
+    ///
+    /// SYN-171 — `half` is "note" or "graph". The batch path must now submit two
+    /// requests per capture and merge them with `merge_classify_halves`; there is
+    /// no default on purpose, so a caller that was not updated fails loudly
+    /// instead of silently classifying half the capture.
+    #[pyo3(signature = (content, day_context, model, prompts_dir, today, half))]
     fn build_classify_params(
         &self,
         py: Python<'_>,
@@ -520,7 +525,17 @@ impl Brain {
         model: &str,
         prompts_dir: &str,
         today: &str,
+        half: &str,
     ) -> PyResult<String> {
+        let half = match half {
+            "note" => synapse_core::ClassifyHalf::Note,
+            "graph" => synapse_core::ClassifyHalf::Graph,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "half inconnu : {other:?} (attendu \"note\" ou \"graph\")"
+                )))
+            }
+        };
         let config = synapse_core::LlmConfig {
             model: model.to_string(),
             api_key: String::new(),
@@ -532,7 +547,7 @@ impl Brain {
             today: today.to_string(),
         };
         let params = py
-            .detach(|| self.inner.build_classify_params(content, day_context, &config))
+            .detach(|| self.inner.build_classify_params(content, day_context, &config, half))
             .map_err(brain_err)?;
         Ok(params.to_string())
     }
@@ -848,6 +863,19 @@ fn parse_classify_text(text: &str, content_len: usize, stop_reason: Option<&str>
         .map_err(brain_err)
 }
 
+/// SYN-171 — fuse the two classifier halves into the single object the router
+/// has always consumed. Exposed rather than reimplemented host-side: two copies
+/// of a merge rule drift, and the drift would be silent (each half owns its own
+/// keys, so a wrong merge loses fields instead of raising).
+#[pyfunction]
+fn merge_classify_halves(note_json: &str, graph_json: &str) -> PyResult<String> {
+    let note: serde_json::Value =
+        serde_json::from_str(note_json).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let graph: serde_json::Value =
+        serde_json::from_str(graph_json).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(synapse_core::merge_halves(note, graph).to_string())
+}
+
 /// SYN-23 — next concrete date of a (possibly recurring) event, ISO strings;
 /// None when `event_date` doesn't parse (Python returned None there too).
 #[pyfunction]
@@ -1072,6 +1100,7 @@ fn synapse_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairing_code_confirm_verify, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(parse_classify_text, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_classify_halves, m)?)?;
     m.add_function(wrap_pyfunction!(next_occurrence, m)?)?;
     m.add_function(wrap_pyfunction!(extract_urls, m)?)?;
     m.add_function(wrap_pyfunction!(extract_page, m)?)?;
